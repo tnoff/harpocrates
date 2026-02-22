@@ -1,0 +1,231 @@
+<script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { untrack } from "svelte";
+
+  interface Props {
+    initial?: {
+      id?: number;
+      name?: string;
+      mode?: string;
+      s3_endpoint?: string;
+      s3_region?: string | null;
+      s3_bucket?: string;
+      s3_access_key?: string;
+      s3_secret_key?: string;
+      extra_env?: string | null;
+      relative_path?: string | null;
+      temp_directory?: string | null;
+    };
+    onsubmit: (data: Record<string, unknown>) => Promise<void>;
+    submitLabel?: string;
+  }
+
+  let { initial = {}, onsubmit, submitLabel = "Create Profile" }: Props = $props();
+
+  // Snapshot the prop values once at mount. The parent always destroys and
+  // recreates this component when the editing target changes ({#if editingProfile}),
+  // so untracked reads here are intentional — the prop won't change mid-lifetime.
+  const iv = untrack(() => ({
+    name: initial.name ?? "",
+    mode: initial.mode ?? "read-write",
+    s3Endpoint: initial.s3_endpoint ?? "",
+    s3Region: initial.s3_region ?? "",
+    s3Bucket: initial.s3_bucket ?? "",
+    s3AccessKey: initial.s3_access_key ?? "",
+    s3SecretKey: initial.s3_secret_key ?? "",
+    extraEnv: initial.extra_env ?? "",
+    relativePath: initial.relative_path ?? "",
+    tempDirectory: initial.temp_directory ?? "",
+  }));
+
+  let name = $state(iv.name);
+  let mode = $state(iv.mode);
+  let s3Endpoint = $state(iv.s3Endpoint);
+  let s3Region = $state(iv.s3Region);
+  let s3Bucket = $state(iv.s3Bucket);
+  let s3AccessKey = $state(iv.s3AccessKey);
+  let s3SecretKey = $state(iv.s3SecretKey);
+  let extraEnv = $state(iv.extraEnv);
+  let relativePath = $state(iv.relativePath);
+  let tempDirectory = $state(iv.tempDirectory);
+  let importKey = $state("");
+  let useImportKey = $state(false);
+
+  let submitting = $state(false);
+  let testing = $state(false);
+  let testResult = $state<{ ok: boolean; message: string } | null>(null);
+  let error = $state("");
+
+  async function handleSubmit() {
+    error = "";
+    submitting = true;
+    try {
+      await onsubmit({
+        name,
+        mode,
+        s3_endpoint: s3Endpoint,
+        s3_region: s3Region || null,
+        s3_bucket: s3Bucket,
+        s3_access_key: s3AccessKey,
+        s3_secret_key: s3SecretKey,
+        extra_env: extraEnv || null,
+        relative_path: relativePath || null,
+        temp_directory: tempDirectory || null,
+        import_encryption_key: useImportKey && importKey ? importKey : null,
+      });
+    } catch (e) {
+      error = String(e);
+    } finally {
+      submitting = false;
+    }
+  }
+
+  async function testConnection() {
+    testing = true;
+    testResult = null;
+    try {
+      const msg = await invoke<string>("test_connection_params", {
+        endpoint: s3Endpoint,
+        region: s3Region || null,
+        bucket: s3Bucket,
+        accessKey: s3AccessKey,
+        secretKey: s3SecretKey,
+        extraEnv: extraEnv || null,
+      });
+      testResult = { ok: true, message: msg };
+    } catch (e) {
+      testResult = { ok: false, message: String(e) };
+    } finally {
+      testing = false;
+    }
+  }
+
+</script>
+
+<form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} style="display: flex; flex-direction: column; gap: 2rem; max-width: 40rem;">
+  <div>
+    <label class="form-label" for="pf-name">Profile Name</label>
+    <input id="pf-name" bind:value={name} required class="form-input" placeholder="My Vault" />
+    <p class="form-hint">A friendly label to identify this connection in the app.</p>
+  </div>
+
+  <div>
+    <label class="form-label" for="pf-mode">Mode</label>
+    <select id="pf-mode" bind:value={mode} class="form-input">
+      <option value="read-write">Read-Write</option>
+      <option value="read-only">Read-Only</option>
+    </select>
+    <p class="form-hint">Read-Write allows uploading and managing files. Read-Only restricts to downloads only.</p>
+  </div>
+
+  <fieldset style="display: flex; flex-direction: column; gap: 1.5rem; border-radius: 0.5rem; padding: 1.25rem;" class="border border-slate-200 dark:border-slate-600">
+    <legend class="text-sm font-semibold px-2 text-slate-700 dark:text-slate-300">S3 Connection</legend>
+
+    <div>
+      <label class="form-label" for="pf-endpoint">Endpoint URL</label>
+      <input id="pf-endpoint" bind:value={s3Endpoint} required class="form-input" placeholder="https://s3.amazonaws.com" />
+      <p class="form-hint">The base URL of your S3-compatible provider. For AWS use <code class="font-mono">https://s3.amazonaws.com</code>; for others check your provider's docs.</p>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+      <div>
+        <label class="form-label" for="pf-region">Region <span class="font-normal text-slate-400 dark:text-slate-500">(optional)</span></label>
+        <input id="pf-region" bind:value={s3Region} class="form-input" placeholder="us-east-1" />
+        <p class="form-hint">Required by AWS and some providers. Leave blank if your provider doesn't use regions.</p>
+      </div>
+      <div>
+        <label class="form-label" for="pf-bucket">Bucket</label>
+        <input id="pf-bucket" bind:value={s3Bucket} required class="form-input" placeholder="my-vault-bucket" />
+        <p class="form-hint">The S3 bucket where your encrypted files will be stored.</p>
+      </div>
+    </div>
+
+    <div>
+      <label class="form-label" for="pf-access-key">Access Key</label>
+      <input id="pf-access-key" bind:value={s3AccessKey} required class="form-input" placeholder="AKIAIOSFODNN7EXAMPLE" />
+      <p class="form-hint">Your S3 access key ID. For AWS, generate one under IAM → Users → Security credentials.</p>
+    </div>
+
+    <div>
+      <label class="form-label" for="pf-secret-key">Secret Key</label>
+      <input id="pf-secret-key" bind:value={s3SecretKey} required type="password" class="form-input" placeholder="••••••••••••••••••••" />
+      <p class="form-hint">Your S3 secret access key. Stored locally on this device only.</p>
+    </div>
+
+    <div>
+      <label class="form-label" for="pf-extra-env">
+        Extra Environment Variables <span class="font-normal text-slate-400 dark:text-slate-500">(optional)</span>
+      </label>
+      <input id="pf-extra-env" bind:value={extraEnv} class="form-input" placeholder="KEY=val,KEY2=val2" />
+      <p class="form-hint">Comma-separated <code class="font-mono">KEY=value</code> pairs passed to the S3 client. Useful for proxy settings or custom TLS configuration.</p>
+    </div>
+  </fieldset>
+
+  <fieldset style="display: flex; flex-direction: column; gap: 1.5rem; border-radius: 0.5rem; padding: 1.25rem;" class="border border-slate-200 dark:border-slate-600">
+    <legend class="text-sm font-semibold px-2 text-slate-700 dark:text-slate-300">Paths <span class="font-normal text-slate-400 dark:text-slate-500">(optional)</span></legend>
+    <div>
+      <label class="form-label" for="pf-relative-path">Relative Path <span class="font-normal text-slate-400 dark:text-slate-500">(S3 prefix)</span></label>
+      <input id="pf-relative-path" bind:value={relativePath} class="form-input" placeholder="vault/" />
+      <p class="form-hint">Scopes all operations to a subfolder within the bucket. Useful when sharing a bucket across multiple vaults.</p>
+    </div>
+    <div>
+      <label class="form-label" for="pf-temp-dir">Temp Directory</label>
+      <div style="display: flex; gap: 0.5rem;">
+        <input id="pf-temp-dir" bind:value={tempDirectory} class="form-input" placeholder="/tmp/vault" />
+        <button
+          type="button"
+          onclick={async () => { const p = await open({ directory: true }); if (p) tempDirectory = p; }}
+          class="btn-secondary"
+          style="flex: none; padding-left: 0.75rem; padding-right: 0.75rem;"
+        >Browse</button>
+      </div>
+      <p class="form-hint">Local folder for temporary files during transfers. Defaults to your system temp folder if left blank.</p>
+    </div>
+  </fieldset>
+
+  {#if !initial.id}
+    <fieldset style="display: flex; flex-direction: column; gap: 1.5rem; border-radius: 0.5rem; padding: 1.25rem;" class="border border-slate-200 dark:border-slate-600">
+      <legend class="text-sm font-semibold px-2 text-slate-700 dark:text-slate-300">Encryption Key</legend>
+      <div>
+        <label style="display: flex; align-items: center; gap: 0.625rem; font-size: 0.875rem; cursor: pointer;">
+          <input type="checkbox" bind:checked={useImportKey} class="w-4 h-4 rounded accent-primary" />
+          Import existing encryption key
+        </label>
+        <p class="form-hint">Check this if you're reconnecting to an existing vault and already have its encryption key.</p>
+      </div>
+      {#if useImportKey}
+        <div>
+          <label class="form-label" for="pf-import-key">Encryption Key</label>
+          <input id="pf-import-key" bind:value={importKey} type="password" class="form-input" placeholder="Paste your 64-character hex key" />
+          <p class="form-hint">Must be the exact 64-character hex key used when the vault was originally created.</p>
+        </div>
+      {:else}
+        <p class="form-warning">⚠ A new encryption key will be generated. You must save it — it cannot be recovered if lost.</p>
+      {/if}
+    </fieldset>
+  {/if}
+
+  {#if testResult}
+    <p style="font-size: 0.875rem; color: {testResult.ok ? '#22c55e' : '#ef4444'};">{testResult.message}</p>
+  {/if}
+
+  {#if error}
+    <p style="font-size: 0.875rem; color: #ef4444;">{error}</p>
+  {/if}
+
+  <div style="display: flex; gap: 0.75rem;">
+    <button type="submit" disabled={submitting} class="btn-primary">
+      {submitting ? "Saving..." : submitLabel}
+    </button>
+    <button
+      type="button"
+      onclick={testConnection}
+      disabled={testing}
+      class="btn-secondary"
+    >
+      {testing ? "Testing..." : "Test Connection"}
+    </button>
+  </div>
+</form>
+

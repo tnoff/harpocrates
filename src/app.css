@@ -1,0 +1,71 @@
+@import "tailwindcss";
+@source "../src/**/*.svelte";
+@source "../src/**/*.ts";
+
+@theme {
+  --color-surface: #f8fafc;
+  --color-surface-dark: #1e293b;
+  --color-sidebar: #f1f5f9;
+  --color-sidebar-dark: #0f172a;
+  --color-primary: #3b82f6;
+  --color-primary-hover: #2563eb;
+  --color-danger: #ef4444;
+  --color-danger-hover: #dc2626;
+  --color-success: #22c55e;
+  --color-warning: #f59e0b;
+}
+
+html {
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+@layer components {
+  .form-input {
+    @apply w-full px-3 py-2.5 rounded-lg border border-slate-300 dark:border-slate-500
+           bg-white dark:bg-slate-700 text-sm text-slate-900 dark:text-slate-100
+           placeholder:text-slate-400 dark:placeholder:text-slate-500
+           focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
+           transition-colors;
+  }
+
+  .form-label {
+    @apply block text-sm font-medium text-slate-700 dark:text-slate-300 mb-1.5;
+  }
+
+  .form-hint {
+    @apply mt-1.5 text-xs text-slate-500 dark:text-slate-400 leading-relaxed;
+  }
+
+  .form-warning {
+    @apply text-xs font-medium text-amber-700 dark:text-amber-400 leading-relaxed;
+    padding: 0.5rem 0.75rem;
+    background: rgb(254 243 199 / 0.6);
+    border-left: 3px solid #f59e0b;
+    border-radius: 0 0.25rem 0.25rem 0;
+  }
+
+  .btn-primary {
+    @apply flex-1 px-4 py-3 bg-primary text-white rounded-lg text-sm font-semibold
+           hover:bg-primary-hover disabled:opacity-50 transition-colors cursor-pointer;
+  }
+
+  .btn-secondary {
+    @apply flex-1 px-4 py-3 bg-slate-200 dark:bg-slate-600 text-slate-700 dark:text-slate-200
+           rounded-lg text-sm font-semibold hover:bg-slate-300 dark:hover:bg-slate-500
+           disabled:opacity-50 transition-colors cursor-pointer;
+  }
+}
+
+body {
+  @apply bg-surface text-slate-900 m-0;
+}
+
+
+@media (prefers-color-scheme: dark) {
+  body {
+    @apply bg-surface-dark text-slate-100;
+  }
+  :root {
+    color-scheme: dark;
+  }
+}
