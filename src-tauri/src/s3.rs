@@ -6,8 +6,25 @@ use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
+
 use crate::error::AppError;
 use crate::throttle::ThrottleState;
+
+/// Convert an S3 SDK error into an AppError, extracting the AWS error code
+/// and message instead of letting the SDK's Display collapse them to "service error".
+fn s3_err<E>(op: &str, e: aws_sdk_s3::error::SdkError<E>) -> AppError
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let detail = match (e.code(), e.message()) {
+        (Some(code), Some(msg)) => format!("{}: {}", code, msg),
+        (Some(code), None) => code.to_string(),
+        (None, Some(msg)) => msg.to_string(),
+        (None, None) => format!("{:?}", e),
+    };
+    AppError::S3(format!("{} failed: {}", op, detail))
+}
 
 /// Minimum S3 multipart part size (5 MiB — S3 hard minimum for all but the last part).
 const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
@@ -40,11 +57,12 @@ impl S3Client {
         extra_env: Option<&str>,
         throttle: ThrottleState,
     ) -> Result<Self, AppError> {
-        // Apply extra environment variables if provided
-        if let Some(env_json) = extra_env {
-            if let Ok(vars) = serde_json::from_str::<std::collections::HashMap<String, String>>(env_json) {
-                for (k, v) in vars {
-                    std::env::set_var(&k, &v);
+        // Apply extra environment variables before loading SDK config.
+        // Format: comma-separated KEY=value pairs (e.g. "KEY=val,KEY2=val2").
+        if let Some(env_str) = extra_env {
+            for pair in env_str.split(',') {
+                if let Some((k, v)) = pair.trim().split_once('=') {
+                    std::env::set_var(k.trim(), v.trim());
                 }
             }
         }
@@ -59,8 +77,17 @@ impl S3Client {
             .load()
             .await;
 
+        // Disable checksum trailer mode: many S3-compatible providers (B2, R2, MinIO, etc.)
+        // reject chunked transfer encoding that the SDK uses when checksums are always computed.
+        // WhenRequired only sends a checksum when the operation mandates it.
         let s3_config = aws_sdk_s3::config::Builder::from(&config)
             .force_path_style(true)
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            )
             .build();
 
         let client = Client::from_conf(s3_config);
@@ -78,7 +105,7 @@ impl S3Client {
             .bucket(&self.bucket)
             .send()
             .await
-            .map_err(|e| AppError::S3(format!("HeadBucket failed: {}", e)))?;
+            .map_err(|e| s3_err("HeadBucket", e))?;
         Ok(())
     }
 
@@ -110,7 +137,7 @@ impl S3Client {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| AppError::S3(format!("PutObject failed: {}", e)))?;
+                .map_err(|e| s3_err("PutObject", e))?;
         }
 
         Ok(())
@@ -126,7 +153,7 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::S3(format!("GetObject failed: {}", e)))?;
+            .map_err(|e| s3_err("GetObject", e))?;
 
         let download_bps = self.throttle.get_download_bps();
 
@@ -180,7 +207,7 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::S3(format!("DeleteObject failed: {}", e)))?;
+            .map_err(|e| s3_err("DeleteObject", e))?;
         Ok(())
     }
 
@@ -193,7 +220,7 @@ impl S3Client {
             .key(dest_key)
             .send()
             .await
-            .map_err(|e| AppError::S3(format!("CopyObject failed: {}", e)))?;
+            .map_err(|e| s3_err("CopyObject", e))?;
         Ok(())
     }
 
@@ -214,7 +241,7 @@ impl S3Client {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| AppError::S3(format!("ListObjectsV2 failed: {}", e)))?;
+                .map_err(|e| s3_err("ListObjectsV2", e))?;
 
             for obj in resp.contents() {
                 if let Some(key) = obj.key() {
@@ -260,7 +287,7 @@ impl S3Client {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| AppError::S3(format!("PutObject failed: {}", e)))?;
+                .map_err(|e| s3_err("PutObject", e))?;
             return Ok(());
         }
 
@@ -273,7 +300,7 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::S3(format!("CreateMultipartUpload failed: {}", e)))?;
+            .map_err(|e| s3_err("CreateMultipartUpload", e))?;
 
         let upload_id = create_resp
             .upload_id()
@@ -302,7 +329,15 @@ impl S3Client {
                     .body(ByteStream::from(part_data.to_vec()))
                     .send()
                     .await
-                    .map_err(|e| AppError::S3(format!("UploadPart {} failed: {}", part_number, e)))?;
+                    .map_err(|e| {
+                        let detail = match (e.code(), e.message()) {
+                            (Some(c), Some(m)) => format!("{}: {}", c, m),
+                            (Some(c), None) => c.to_string(),
+                            (None, Some(m)) => m.to_string(),
+                            (None, None) => format!("{:?}", e),
+                        };
+                        AppError::S3(format!("UploadPart {} failed: {}", part_number, detail))
+                    })?;
 
                 let etag = resp.e_tag().unwrap_or_default().to_string();
                 completed_parts.push(
@@ -337,7 +372,7 @@ impl S3Client {
                     .multipart_upload(completed)
                     .send()
                     .await
-                    .map_err(|e| AppError::S3(format!("CompleteMultipartUpload failed: {}", e)))?;
+                    .map_err(|e| s3_err("CompleteMultipartUpload", e))?;
                 Ok(())
             }
             Err(e) => {

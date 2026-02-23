@@ -13,7 +13,7 @@ impl DbState {
     }
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 pub fn init_database(path: &str) -> Result<Connection, AppError> {
     let conn = Connection::open(path)?;
@@ -22,8 +22,13 @@ pub fn init_database(path: &str) -> Result<Connection, AppError> {
 
     let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
-    if version < SCHEMA_VERSION {
+    if version < 1 {
         create_schema(&conn)?;
+    }
+    if version < 2 {
+        migrate_v1_to_v2(&conn)?;
+    }
+    if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
 
@@ -44,8 +49,7 @@ fn create_schema(conn: &Connection) -> Result<(), AppError> {
             relative_path TEXT,
             temp_directory TEXT,
             is_active BOOLEAN NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(s3_endpoint, s3_bucket)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
         CREATE TABLE IF NOT EXISTS backup_entry (
@@ -86,6 +90,43 @@ fn create_schema(conn: &Connection) -> Result<(), AppError> {
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(backup_entry_id, local_path)
         );
+        ",
+    )?;
+    Ok(())
+}
+
+/// Remove the UNIQUE(s3_endpoint, s3_bucket) constraint from the profile table.
+/// SQLite doesn't support DROP CONSTRAINT, so we recreate the table without it.
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = OFF;
+        BEGIN;
+
+        CREATE TABLE IF NOT EXISTS profile_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            mode TEXT NOT NULL DEFAULT 'read-write',
+            s3_endpoint TEXT NOT NULL,
+            s3_region TEXT,
+            s3_bucket TEXT NOT NULL,
+            extra_env TEXT,
+            relative_path TEXT,
+            temp_directory TEXT,
+            is_active BOOLEAN NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        INSERT OR IGNORE INTO profile_v2
+            SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket,
+                   extra_env, relative_path, temp_directory, is_active, created_at
+            FROM profile;
+
+        DROP TABLE profile;
+        ALTER TABLE profile_v2 RENAME TO profile;
+
+        COMMIT;
+        PRAGMA foreign_keys = ON;
         ",
     )?;
     Ok(())
@@ -550,14 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn test_unique_endpoint_bucket() {
-        let conn = setup_db();
-        insert_profile(&conn, "p1", "read-write", "https://a.com", None, "bucket", None, None, None).unwrap();
-        let result = insert_profile(&conn, "p2", "read-write", "https://a.com", None, "bucket", None, None, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_unique_profile_name() {
         let conn = setup_db();
         insert_profile(&conn, "same-name", "read-write", "https://a.com", None, "b1", None, None, None).unwrap();
@@ -685,7 +718,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let conn = init_database(db_path.to_str().unwrap()).unwrap();
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]

@@ -161,6 +161,8 @@
   .op-result {
     font-size: 0.75rem;
     color: #64748b;
+    word-break: break-word;
+    white-space: pre-wrap;
   }
 
   .op-error .op-result { color: #ef4444; }

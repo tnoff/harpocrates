@@ -157,6 +157,28 @@ pub fn create_profile(
     )
 }
 
+#[derive(serde::Serialize)]
+pub struct ProfileCredentials {
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+}
+
+/// Retrieve the S3 access key and secret key for a profile from the OS keychain.
+/// Used to pre-populate credential fields when editing an existing profile.
+#[tauri::command]
+pub fn get_profile_credentials(
+    db: State<DbState>,
+    profile_id: i64,
+) -> Result<ProfileCredentials, AppError> {
+    let conn = db.conn()?;
+    let profile = db::get_profile_by_id(&conn, profile_id)?
+        .ok_or_else(|| AppError::NotFound(format!("Profile {} not found", profile_id)))?;
+    Ok(ProfileCredentials {
+        s3_access_key: credentials::get_s3_access_key(&profile.name)?,
+        s3_secret_key: credentials::get_s3_secret_key(&profile.name)?,
+    })
+}
+
 #[tauri::command]
 pub fn list_profiles(db: State<DbState>) -> Result<Vec<db::Profile>, AppError> {
     let conn = db.conn()?;
@@ -765,6 +787,7 @@ pub async fn receive_manifest(
 
 #[tauri::command]
 pub async fn download_from_manifest(
+    app: tauri::AppHandle,
     db: State<'_, DbState>,
     manifest_uuid: String,
     selected_uuids: Vec<String>,
@@ -806,6 +829,15 @@ pub async fn download_from_manifest(
     let mut summary = RestoreSummary { total: to_download.len(), ..Default::default() };
 
     for file_entry in to_download {
+        let _ = app.emit("restore:progress", RestoreProgressEvent {
+            processed: summary.restored + summary.skipped + summary.failed,
+            total: summary.total,
+            current_file: file_entry.filename.clone(),
+            restored: summary.restored,
+            skipped: summary.skipped,
+            failed: summary.failed,
+        });
+
         let target_path = save_dir.join(&file_entry.filename);
         let temp_enc = crypto::generate_temp_path(&temp_dir);
 
@@ -1397,6 +1429,40 @@ pub async fn delete_backup_entries(
 }
 
 // ══════════════════════════════════════════════════════
+// Config
+// ══════════════════════════════════════════════════════
+
+/// Return the current app configuration.
+#[tauri::command]
+pub fn get_config() -> Result<crate::config::AppConfig, AppError> {
+    crate::config::load_or_create_config()
+}
+
+/// Change the database file path saved in config.json.
+/// If `copy_existing` is true and the current database file exists, it is
+/// copied to the new location first. The change takes effect on next launch.
+#[tauri::command]
+pub fn set_database_path(new_path: String, copy_existing: bool) -> Result<(), AppError> {
+    let current = crate::config::load_or_create_config()?;
+
+    if copy_existing {
+        let src = std::path::Path::new(&current.database_path);
+        if src.exists() {
+            let dest = std::path::Path::new(&new_path);
+            if let Some(parent) = dest.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::copy(src, dest)?;
+        }
+    }
+
+    let new_config = crate::config::AppConfig { database_path: new_path };
+    crate::config::save_config(&new_config)?;
+    Ok(())
+}
+
 // Throttle
 // ══════════════════════════════════════════════════════
 

@@ -165,9 +165,17 @@
   <fieldset style="display: flex; flex-direction: column; gap: 1.5rem; border-radius: 0.5rem; padding: 1.25rem;" class="border border-slate-200 dark:border-slate-600">
     <legend class="text-sm font-semibold px-2 text-slate-700 dark:text-slate-300">Paths <span class="font-normal text-slate-400 dark:text-slate-500">(optional)</span></legend>
     <div>
-      <label class="form-label" for="pf-relative-path">Relative Path <span class="font-normal text-slate-400 dark:text-slate-500">(S3 prefix)</span></label>
-      <input id="pf-relative-path" bind:value={relativePath} class="form-input" placeholder="vault/" />
-      <p class="form-hint">Scopes all operations to a subfolder within the bucket. Useful when sharing a bucket across multiple vaults.</p>
+      <label class="form-label" for="pf-relative-path">Relative Path <span class="font-normal text-slate-400 dark:text-slate-500">(base directory)</span></label>
+      <div style="display: flex; gap: 0.5rem;">
+        <input id="pf-relative-path" bind:value={relativePath} class="form-input" placeholder="/home/user/documents" />
+        <button
+          type="button"
+          onclick={async () => { const p = await open({ directory: true }); if (p) relativePath = p; }}
+          class="btn-secondary"
+          style="flex: none; padding-left: 0.75rem; padding-right: 0.75rem;"
+        >Browse</button>
+      </div>
+      <p class="form-hint">Local base directory to strip when storing file paths. For example, with a base of <code class="font-mono">/home/user/docs</code>, the file <code class="font-mono">/home/user/docs/report.pdf</code> is stored and restored as <code class="font-mono">report.pdf</code> relative to that path.</p>
     </div>
     <div>
       <label class="form-label" for="pf-temp-dir">Temp Directory</label>

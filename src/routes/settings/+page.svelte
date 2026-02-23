@@ -6,7 +6,21 @@
   import { profileStore, type Profile } from "$lib/stores/profile.svelte";
   import { toast } from "$lib/stores/toast.svelte";
 
-  let editingProfile = $state<Profile | null>(null);
+  type EditingProfile = Profile & { s3_access_key?: string; s3_secret_key?: string };
+  let editingProfile = $state<EditingProfile | null>(null);
+
+  async function startEditProfile(profile: Profile) {
+    try {
+      const creds = await invoke<{ s3_access_key: string; s3_secret_key: string }>(
+        "get_profile_credentials",
+        { profileId: profile.id },
+      );
+      editingProfile = { ...profile, ...creds };
+    } catch {
+      // Keychain unavailable — open form with blank credential fields
+      editingProfile = { ...profile };
+    }
+  }
   let deletingProfile = $state<Profile | null>(null);
   let testingId = $state<number | null>(null);
   let testResult = $state<{ id: number; ok: boolean; message: string } | null>(null);
@@ -81,7 +95,44 @@
 
   $effect(() => { loadThrottle(); });
 
-  // ── Database ──────────────────────────────────────────
+  // ── Database location ────────────────────────────────
+
+  interface AppConfig { database_path: string; }
+
+  let currentDbPath = $state("");
+  let newDbPath = $state("");
+  let copyExisting = $state(true);
+  let dbPendingRestart = $state(false);
+
+  async function loadDbPath() {
+    try {
+      const cfg = await invoke<AppConfig>("get_config");
+      currentDbPath = cfg.database_path;
+      newDbPath = cfg.database_path;
+    } catch { /* ignore */ }
+  }
+
+  async function browseDbPath() {
+    const p = await save({
+      defaultPath: "harpocrates.db",
+      filters: [{ name: "SQLite Database", extensions: ["db"] }],
+    });
+    if (p) newDbPath = p;
+  }
+
+  async function applyDbPath() {
+    try {
+      await invoke("set_database_path", { newPath: newDbPath, copyExisting });
+      currentDbPath = newDbPath;
+      dbPendingRestart = true;
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  $effect(() => { loadDbPath(); });
+
+  // ── Database export / import ─────────────────────────
 
   async function exportDb() {
     const path = await save({ defaultPath: "harpocrates-export.json", filters: [{ name: "JSON", extensions: ["json"] }] });
@@ -143,7 +194,7 @@
             >
               {testingId === profile.id ? "Testing..." : "Test"}
             </button>
-            <button onclick={() => editingProfile = profile} class="btn-xs btn-neutral">Edit</button>
+            <button onclick={() => startEditProfile(profile)} class="btn-xs btn-neutral">Edit</button>
             <button onclick={() => deletingProfile = profile} class="btn-xs btn-destructive">Delete</button>
           </div>
         </div>
@@ -183,6 +234,35 @@
   <!-- Database -->
   <section class="section">
     <h3 class="section-title">Database</h3>
+
+    <div>
+      <label class="field-label" for="db-path">Database File Location</label>
+      <div class="path-row">
+        <input
+          id="db-path"
+          bind:value={newDbPath}
+          class="path-input"
+          placeholder="/path/to/harpocrates.db"
+        />
+        <button type="button" onclick={browseDbPath} class="btn-secondary" style="flex: none;">
+          Browse
+        </button>
+      </div>
+      <p class="section-hint">Takes effect after restarting the app.</p>
+    </div>
+
+    {#if newDbPath && newDbPath !== currentDbPath}
+      <label class="copy-label">
+        <input type="checkbox" bind:checked={copyExisting} />
+        Copy existing database to new location
+      </label>
+      <button onclick={applyDbPath} class="btn-primary">Apply</button>
+    {/if}
+
+    {#if dbPendingRestart}
+      <p class="restart-notice">⚠ Restart Harpocrates to use the new database location.</p>
+    {/if}
+
     <div class="btn-row">
       <button onclick={exportDb} class="btn-secondary">Export Database</button>
       <button onclick={importDb} class="btn-secondary">Import Database</button>
@@ -383,6 +463,48 @@
     box-shadow: 0 0 0 2px rgb(59 130 246 / 0.2);
   }
 
+  /* Database path */
+  .path-row {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .path-input {
+    flex: 1;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid #cbd5e1;
+    background: white;
+    font-size: 0.875rem;
+    font-family: monospace;
+    outline: none;
+    transition: border-color 0.15s;
+    min-width: 0;
+  }
+
+  .path-input:focus {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px rgb(59 130 246 / 0.2);
+  }
+
+  .copy-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+    cursor: pointer;
+  }
+
+  .restart-notice {
+    font-size: 0.8125rem;
+    color: #b45309;
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    background: #fffbeb;
+    border: 1px solid #fcd34d;
+    border-radius: 0.5rem;
+  }
+
   /* Button row */
   .btn-row {
     display: flex;
@@ -485,6 +607,9 @@
     .profile-meta { color: #94a3b8; }
     .badge-active { background: rgb(59 130 246 / 0.2); color: #60a5fa; }
     .number-input { background: #1e293b; border-color: #475569; color: #f1f5f9; }
+    .path-input { background: #1e293b; border-color: #475569; color: #f1f5f9; }
+    .copy-label { color: #cbd5e1; }
+    .restart-notice { background: #1c1a0e; border-color: #78350f; color: #fcd34d; }
     .btn-secondary { background: #334155; color: #cbd5e1; }
     .btn-secondary:hover { background: #475569; }
     .btn-neutral { background: #334155; color: #cbd5e1; }

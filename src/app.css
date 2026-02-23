@@ -1,6 +1,4 @@
 @import "tailwindcss";
-@source "../src/**/*.svelte";
-@source "../src/**/*.ts";
 
 @theme {
   --color-surface: #f8fafc;

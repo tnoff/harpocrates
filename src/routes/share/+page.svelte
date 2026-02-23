@@ -1,15 +1,18 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { profileStore } from "$lib/stores/profile.svelte";
   import { selectionStore } from "$lib/stores/selection.svelte";
   import { toast } from "$lib/stores/toast.svelte";
+  import { operationsStore } from "$lib/stores/operations.svelte";
 
   interface ManifestFileEntry { uuid: string; filename: string; size: number; }
   interface ManifestFileList { manifest_uuid: string; files: ManifestFileEntry[]; }
   interface ShareManifest { id: number; profile_id: number; manifest_uuid: string; label: string | null; file_count: number; is_valid: boolean; created_at: string; }
   interface RestoreSummary { total: number; restored: number; skipped: number; failed: number; failures: { filename: string; error: string }[]; }
+  interface RestoreProgress { processed: number; total: number; current_file: string; restored: number; skipped: number; failed: number; }
 
   let activeTab = $state<"create" | "receive" | "manager">(profileStore.isReadOnly ? "receive" : "create");
 
@@ -46,12 +49,10 @@
   let manifestFiles = $state<ManifestFileList | null>(null);
   let selectedFileUuids = $state<Set<string>>(new Set());
   let downloading = $state(false);
-  let downloadSummary = $state<RestoreSummary | null>(null);
 
   async function fetchManifest() {
     fetching = true;
     manifestFiles = null;
-    downloadSummary = null;
     try {
       manifestFiles = await invoke<ManifestFileList>("receive_manifest", { manifestUuid: receiveUuid });
       selectedFileUuids = new Set(manifestFiles.files.map(f => f.uuid));
@@ -71,16 +72,36 @@
   async function downloadFiles() {
     const path = await open({ directory: true });
     if (!path || !manifestFiles) return;
+
+    const count = selectedFileUuids.size;
+    const label = count === 1 ? "Downloading 1 file" : `Downloading ${count} files`;
+    const id = operationsStore.add(label);
+
+    const unlisten = await listen<RestoreProgress>("restore:progress", (event) => {
+      const p = event.payload;
+      operationsStore.updateProgress(id, {
+        current: p.processed,
+        total: p.total,
+        detail: p.current_file.split("/").at(-1),
+      });
+    });
+
     downloading = true;
     try {
-      downloadSummary = await invoke<RestoreSummary>("download_from_manifest", {
+      const summary = await invoke<RestoreSummary>("download_from_manifest", {
         manifestUuid: manifestFiles.manifest_uuid,
         selectedUuids: [...selectedFileUuids],
         saveDirectory: path,
       });
+      const parts = [
+        `${summary.restored} downloaded`,
+        summary.failed > 0 ? `${summary.failed} failed` : null,
+      ].filter(Boolean);
+      operationsStore.complete(id, parts.join(", "));
     } catch (e) {
-      toast.error(String(e));
+      operationsStore.fail(id, String(e));
     } finally {
+      unlisten();
       downloading = false;
     }
   }
@@ -218,16 +239,6 @@
         <button onclick={downloadFiles} disabled={downloading || selectedFileUuids.size === 0} class="btn-primary">
           {downloading ? "Downloading..." : `Download ${selectedFileUuids.size} file(s)`}
         </button>
-      {/if}
-
-      {#if downloadSummary}
-        <div class="success-box">
-          <p class="success-heading">Download Complete</p>
-          <div class="summary-grid">
-            <div>Restored:</div><div class="fw-medium">{downloadSummary.restored}</div>
-            <div>Failed:</div><div class="fw-medium" class:text-danger={downloadSummary.failed > 0}>{downloadSummary.failed}</div>
-          </div>
-        </div>
       {/if}
     </div>
   {/if}
@@ -417,17 +428,6 @@
   }
 
   .btn-copy:hover { background: #86efac; }
-
-  /* Summary grid */
-  .summary-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.25rem 0.5rem;
-    font-size: 0.875rem;
-  }
-
-  .fw-medium { font-weight: 500; }
-  .text-danger { color: #ef4444; }
 
   /* Table */
   .table-wrap {

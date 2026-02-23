@@ -1,4 +1,4 @@
-# Vault
+# Harpocrates
 
 A cross-platform desktop application for encrypted, deduplicated file backup to any S3-compatible object store.
 
@@ -14,13 +14,13 @@ Files are encrypted **before** they leave your machine. The S3 bucket contains o
 - **Change detection** — skips files whose size and modification time haven't changed; optionally force a full checksum comparison
 - **Multiple profiles** — separate configurations for different S3 buckets or encryption keys
 - **Read-only profiles** — mount a bucket as read-only for safe browsing and restore without risking writes
-- **Share manifests** — generate a UUID token that lets another Vault user download specific files without exposing your full bucket
+- **Share manifests** — generate a UUID token that lets another Harpocrates user download specific files without exposing your full bucket
 - **Integrity verification** — re-download and re-hash any file to confirm it hasn't been tampered with
 - **Scramble (re-encrypt)** — assign new random UUIDs to selected files; invalidates any share tokens referencing them
 - **Bandwidth throttling** — set upload and download limits in KB/s; limits apply to the next chunk during active transfers
 - **Orphan cleanup** — find and remove dangling database entries or S3 objects that have lost their counterpart
 - **Database export / import** — portable JSON export of the local metadata database
-- **Real-time progress** — backup, restore, verify, and scramble all report per-file progress and running totals
+- **Real-time progress** — backup, restore, verify, and scramble all report per-file progress in the persistent status footer
 
 ---
 
@@ -32,7 +32,7 @@ See [SECURITY.md](SECURITY.md) for full details. The short version:
 |-------------------|-----|
 | File contents | AES-256-GCM with a per-file random salt and nonce derived via Argon2id |
 | S3 credentials | OS keychain (Keychain on macOS, Credential Manager on Windows, Secret Service on Linux) |
-| Encryption key | Held only by you — shown once at profile creation, never stored by Vault |
+| Encryption key | Held only by you — shown once at profile creation, never stored by Harpocrates |
 
 Your **encryption key** is shown once at profile creation. **It cannot be recovered if lost.** Store it somewhere safe — a password manager, printed paper backup, etc.
 
@@ -64,22 +64,22 @@ Download the latest release for your platform from the [Releases page](../../rel
 ### Linux — AppImage
 
 ```bash
-chmod +x vault_*.AppImage
-./vault_*.AppImage
+chmod +x harpocrates_*.AppImage
+./harpocrates_*.AppImage
 ```
 
 ### Linux — .deb
 
 ```bash
-sudo dpkg -i vault_*.deb
-vault
+sudo dpkg -i harpocrates_*.deb
+harpocrates
 ```
 
 ---
 
 ## First-time Setup
 
-1. Launch Vault. You will be taken to the **Setup** screen.
+1. Launch Harpocrates. You will be taken to the **Setup** screen.
 2. Fill in your S3 connection details:
    - **Profile Name** — a label for this configuration (e.g. "Personal Backups")
    - **S3 Endpoint** — e.g. `https://s3.amazonaws.com` for AWS, or your provider's URL
@@ -87,7 +87,7 @@ vault
    - **Bucket** — the S3 bucket name
    - **Access Key / Secret Key** — your S3 credentials
 3. Click **Create Profile**.
-4. **Copy and save your encryption key.** This key is generated fresh and displayed once. Vault does not store it anywhere. If you lose it, your files cannot be decrypted.
+4. **Copy and save your encryption key.** This key is generated fresh and displayed once. Harpocrates does not store it anywhere. If you lose it, your files cannot be decrypted.
 5. Click **I've saved my key — Continue**.
 
 ---
@@ -98,7 +98,7 @@ vault
 
 **Single file:** In the Files tab, click **Upload** and select a file.
 
-**Directory:** Click **Backup Directory**, select a folder, optionally add skip patterns (regular expressions matched against full paths, e.g. `\.log$`), then click **Start Backup**. A live progress bar shows per-file status with running totals for uploaded, deduped, skipped, and failed files. You can cancel at any time.
+**Directory:** Click **Backup Directory**, select a folder, optionally add skip patterns (regular expressions matched against full paths, e.g. `\.log$`), then click **Start Backup**. Progress is tracked in the status footer at the bottom of the window — the modal closes immediately and the backup continues in the background. You can cancel at any time from the footer.
 
 ### Restoring files
 
@@ -106,7 +106,7 @@ Select one or more files in the Files tab, then click **Restore**. Choose to res
 
 ### Verifying integrity
 
-Select files and click **Verify**. Vault re-downloads and re-hashes each file against the stored checksum. Any mismatch is flagged with details.
+Select files and click **Verify**. Harpocrates re-downloads and re-hashes each file against the stored checksum. Any mismatch is flagged with details.
 
 ### Sharing files
 
@@ -114,9 +114,9 @@ Go to the **Share** tab. Select files first in the **Files** tab, then:
 
 1. **Create** a share manifest — generates a UUID token.
 2. Give the UUID to the recipient.
-3. The recipient opens the **Receive** tab in their own Vault, pastes the UUID, selects which files to download, and picks a save directory.
+3. The recipient opens the **Receive** tab in their own Harpocrates, pastes the UUID, selects which files to download, and picks a save directory.
 
-> The recipient needs a Vault profile pointing at the same S3 bucket. They do not need your encryption key — the manifest embeds the necessary metadata.
+> The recipient needs a Harpocrates profile pointing at the same S3 bucket. They do not need your encryption key — the manifest embeds the necessary metadata.
 
 ### Scramble
 
@@ -146,8 +146,8 @@ s3://your-bucket/
 If you configure a **Relative Path** prefix in your profile, all objects are stored under it:
 
 ```
-s3://your-bucket/vault/
-  vault/550e8400-...
+s3://your-bucket/backups/
+  backups/550e8400-...
 ```
 
 ---
@@ -156,12 +156,12 @@ s3://your-bucket/vault/
 
 | Platform | Path |
 |----------|------|
-| Linux / macOS | `~/.vault/` |
-| Windows | `%USERPROFILE%\.vault\` |
+| Linux / macOS | `~/.harpocrates/` |
+| Windows | `%USERPROFILE%\.harpocrates\` |
 
 | File | Contents |
 |------|----------|
-| `vault.db` | SQLite — file index, profiles, share manifests |
+| `harpocrates.db` | SQLite — file index, profiles, share manifests |
 | `config.json` | App config (database path) |
 
-S3 credentials are stored in the OS keychain, not in `vault.db`. The encryption key is stored nowhere by Vault.
+S3 credentials are stored in the OS keychain, not in `harpocrates.db`. The encryption key is stored nowhere by Harpocrates.

@@ -45,6 +45,7 @@ pub fn run() {
             commands::get_table_count,
             // Phase 2: Profiles
             commands::create_profile,
+            commands::get_profile_credentials,
             commands::list_profiles,
             commands::get_active_profile,
             commands::switch_profile,
@@ -80,6 +81,9 @@ pub fn run() {
             // File browser
             commands::list_files,
             commands::delete_backup_entries,
+            // Config
+            commands::get_config,
+            commands::set_database_path,
             // Throttle
             commands::set_throttle_limits,
             commands::get_throttle_limits,

@@ -48,6 +48,13 @@ pub fn load_or_create_config() -> Result<AppConfig, AppError> {
     }
 }
 
+/// Save config to the default config path.
+pub fn save_config(config: &AppConfig) -> Result<(), AppError> {
+    let json = serde_json::to_string_pretty(config)?;
+    fs::write(config_path(), json)?;
+    Ok(())
+}
+
 /// Load config from a specific path (used for testing)
 pub fn load_config_from(path: &std::path::Path) -> Result<AppConfig, AppError> {
     let contents = fs::read_to_string(path)?;
