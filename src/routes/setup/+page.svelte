@@ -45,7 +45,7 @@
 
 <div style="min-height: 100vh; overflow-y: auto; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem;" class="dark:bg-surface-dark">
   <div style="width: 100%; max-width: 40rem;">
-    <h1 style="font-size: 2rem; font-weight: 700; text-align: center; margin-bottom: 0.5rem;">Welcome to Vault</h1>
+    <h1 style="font-size: 2rem; font-weight: 700; text-align: center; margin-bottom: 0.5rem;">Welcome to Harpocrates</h1>
     <p style="font-size: 1.125rem; text-align: center; margin-bottom: 2rem; opacity: 0.6;">Set up your first profile to get started.</p>
 
     {#if encryptionKey}

@@ -43,7 +43,7 @@ fn md5_of_file(path: &Path) -> Result<String, AppError> {
 
 pub fn generate_temp_path(temp_dir: &Path) -> std::path::PathBuf {
     let id = uuid::Uuid::new_v4();
-    temp_dir.join(format!("vault-tmp-{}", id))
+    temp_dir.join(format!("harpocrates-tmp-{}", id))
 }
 
 /// Encrypt a file using AES-256-GCM with Argon2id key derivation.
@@ -156,7 +156,7 @@ pub fn compute_file_md5(path: &Path) -> Result<String, AppError> {
     md5_of_file(path)
 }
 
-/// Clean up vault temp files from a directory.
+/// Clean up harpocrates temp files from a directory.
 pub fn cleanup_temp_files(temp_dir: &Path) -> Result<usize, AppError> {
     let mut count = 0;
     if !temp_dir.exists() {
@@ -166,7 +166,7 @@ pub fn cleanup_temp_files(temp_dir: &Path) -> Result<usize, AppError> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if name_str.starts_with("vault-tmp-") {
+        if name_str.starts_with("harpocrates-tmp-") {
             if let Err(e) = fs::remove_file(entry.path()) {
                 eprintln!("Warning: failed to remove temp file {:?}: {}", entry.path(), e);
             } else {
@@ -189,7 +189,7 @@ mod tests {
         let encrypted = dir.path().join("encrypted.bin");
         let decrypted = dir.path().join("decrypted.txt");
 
-        let original_data = b"Hello, Vault! This is a test file for encryption.";
+        let original_data = b"Hello, Harpocrates! This is a test file for encryption.";
         fs::write(&input, original_data).unwrap();
 
         let passphrase = "test-passphrase-123";
@@ -290,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = generate_temp_path(dir.path());
         let filename = path.file_name().unwrap().to_string_lossy();
-        assert!(filename.starts_with("vault-tmp-"));
+        assert!(filename.starts_with("harpocrates-tmp-"));
     }
 
     #[test]
@@ -298,8 +298,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // Create some temp files and a non-temp file
-        fs::write(dir.path().join("vault-tmp-abc"), "tmp1").unwrap();
-        fs::write(dir.path().join("vault-tmp-def"), "tmp2").unwrap();
+        fs::write(dir.path().join("harpocrates-tmp-abc"), "tmp1").unwrap();
+        fs::write(dir.path().join("harpocrates-tmp-def"), "tmp2").unwrap();
         fs::write(dir.path().join("other-file.txt"), "keep").unwrap();
 
         let cleaned = cleanup_temp_files(dir.path()).unwrap();
@@ -307,8 +307,8 @@ mod tests {
 
         // Non-temp file should remain
         assert!(dir.path().join("other-file.txt").exists());
-        assert!(!dir.path().join("vault-tmp-abc").exists());
-        assert!(!dir.path().join("vault-tmp-def").exists());
+        assert!(!dir.path().join("harpocrates-tmp-abc").exists());
+        assert!(!dir.path().join("harpocrates-tmp-def").exists());
     }
 
     #[test]

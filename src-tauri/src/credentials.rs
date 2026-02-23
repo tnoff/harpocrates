@@ -1,6 +1,6 @@
 use crate::error::AppError;
 
-const SERVICE_PREFIX: &str = "vault";
+const SERVICE_PREFIX: &str = "harpocrates";
 
 fn service_name(profile_name: &str, key_type: &str) -> String {
     format!("{}:{}:{}", SERVICE_PREFIX, profile_name, key_type)
@@ -77,18 +77,18 @@ mod tests {
     #[test]
     fn test_service_name_format() {
         let name = service_name("my-profile", "s3-access-key");
-        assert_eq!(name, "vault:my-profile:s3-access-key");
+        assert_eq!(name, "harpocrates:my-profile:s3-access-key");
     }
 
     #[test]
     fn test_service_name_encryption_key() {
         let name = service_name("prod", "encryption-key");
-        assert_eq!(name, "vault:prod:encryption-key");
+        assert_eq!(name, "harpocrates:prod:encryption-key");
     }
 
     #[test]
     fn test_service_name_with_special_chars() {
         let name = service_name("profile-with-dashes", "s3-secret-key");
-        assert_eq!(name, "vault:profile-with-dashes:s3-secret-key");
+        assert_eq!(name, "harpocrates:profile-with-dashes:s3-secret-key");
     }
 }

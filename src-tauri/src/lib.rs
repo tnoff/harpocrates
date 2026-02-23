@@ -18,7 +18,7 @@ mod integration_tests;
 pub fn run() {
     let app_config = config::load_or_create_config().expect("Failed to load or create config");
 
-    println!("Vault config loaded: {:?}", app_config);
+    println!("Harpocrates config loaded: {:?}", app_config);
     println!("Database path: {}", app_config.database_path);
 
     let conn = db::init_database(&app_config.database_path)

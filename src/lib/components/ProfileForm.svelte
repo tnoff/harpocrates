@@ -106,7 +106,7 @@
 <form onsubmit={(e) => { e.preventDefault(); handleSubmit(); }} style="display: flex; flex-direction: column; gap: 2rem; max-width: 40rem;">
   <div>
     <label class="form-label" for="pf-name">Profile Name</label>
-    <input id="pf-name" bind:value={name} required class="form-input" placeholder="My Vault" />
+    <input id="pf-name" bind:value={name} required class="form-input" placeholder="My Harpocrates" />
     <p class="form-hint">A friendly label to identify this connection in the app.</p>
   </div>
 
@@ -172,7 +172,7 @@
     <div>
       <label class="form-label" for="pf-temp-dir">Temp Directory</label>
       <div style="display: flex; gap: 0.5rem;">
-        <input id="pf-temp-dir" bind:value={tempDirectory} class="form-input" placeholder="/tmp/vault" />
+        <input id="pf-temp-dir" bind:value={tempDirectory} class="form-input" placeholder="/tmp/harpocrates" />
         <button
           type="button"
           onclick={async () => { const p = await open({ directory: true }); if (p) tempDirectory = p; }}

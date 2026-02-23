@@ -84,7 +84,7 @@
   // ── Database ──────────────────────────────────────────
 
   async function exportDb() {
-    const path = await save({ defaultPath: "vault-export.json", filters: [{ name: "JSON", extensions: ["json"] }] });
+    const path = await save({ defaultPath: "harpocrates-export.json", filters: [{ name: "JSON", extensions: ["json"] }] });
     if (!path) return;
     try {
       await invoke("export_database", { filePath: path });

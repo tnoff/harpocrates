@@ -1,12 +1,12 @@
 [package]
-name = "vault"
+name = "harpocrates"
 version = "0.1.0"
 description = "Encrypted S3 File Manager"
 authors = ["tnorth"]
 edition = "2021"
 
 [lib]
-name = "vault_lib"
+name = "harpocrates_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

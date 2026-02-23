@@ -58,15 +58,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Set version from VERSION file
+        id: version
+        run: |
+          node scripts/set-version.mjs
+          node -e "process.stdout.write('version=' + require('fs').readFileSync('VERSION','utf8').trim() + '\n')" >> "$GITHUB_OUTPUT"
+        shell: bash
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: "Vault ${{ github.ref_name }}"
+          releaseName: "Harpocrates ${{ steps.version.outputs.version }}"
           releaseBody: |
-            See the assets below to download and install this version of Vault.
+            See the assets below to download and install this version of Harpocrates.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

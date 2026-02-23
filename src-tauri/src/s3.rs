@@ -49,7 +49,7 @@ impl S3Client {
             }
         }
 
-        let credentials = Credentials::new(access_key, secret_key, None, None, "vault");
+        let credentials = Credentials::new(access_key, secret_key, None, None, "harpocrates");
         let region = Region::new(region.unwrap_or("us-east-1").to_string());
 
         let config = aws_config::defaults(BehaviorVersion::latest())

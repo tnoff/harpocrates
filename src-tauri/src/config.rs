@@ -12,25 +12,25 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let vault_dir = vault_dir();
+        let dir = app_dir();
         Self {
-            database_path: vault_dir.join("vault.db").to_string_lossy().into_owned(),
+            database_path: dir.join("harpocrates.db").to_string_lossy().into_owned(),
         }
     }
 }
 
-pub fn vault_dir() -> PathBuf {
+pub fn app_dir() -> PathBuf {
     dirs::home_dir()
         .expect("Could not determine home directory")
-        .join(".vault")
+        .join(".harpocrates")
 }
 
 pub fn config_path() -> PathBuf {
-    vault_dir().join("config.json")
+    app_dir().join("config.json")
 }
 
 pub fn load_or_create_config() -> Result<AppConfig, AppError> {
-    let dir = vault_dir();
+    let dir = app_dir();
     if !dir.exists() {
         fs::create_dir_all(&dir)?;
     }
@@ -69,8 +69,8 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
-        assert!(config.database_path.contains("vault.db"));
-        assert!(config.database_path.contains(".vault"));
+        assert!(config.database_path.contains("harpocrates.db"));
+        assert!(config.database_path.contains(".harpocrates"));
     }
 
     #[test]
@@ -89,17 +89,17 @@ mod tests {
         let config_path = dir.path().join("config.json");
 
         let config = AppConfig {
-            database_path: "/custom/path/vault.db".into(),
+            database_path: "/custom/path/harpocrates.db".into(),
         };
         save_config_to(&config, &config_path).unwrap();
 
         let loaded = load_config_from(&config_path).unwrap();
-        assert_eq!(loaded.database_path, "/custom/path/vault.db");
+        assert_eq!(loaded.database_path, "/custom/path/harpocrates.db");
     }
 
     #[test]
-    fn test_vault_dir() {
-        let dir = vault_dir();
-        assert!(dir.to_string_lossy().contains(".vault"));
+    fn test_app_dir() {
+        let dir = app_dir();
+        assert!(dir.to_string_lossy().contains(".harpocrates"));
     }
 }

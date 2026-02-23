@@ -5,10 +5,16 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import StatusFooter from "$lib/components/StatusFooter.svelte";
+  import { getVersion } from "@tauri-apps/api/app";
 
   let { children } = $props();
 
   let showProfileMenu = $state(false);
+  let appVersion = $state("");
+
+  $effect(() => {
+    getVersion().then((v) => (appVersion = v));
+  });
 
   const navItems = $derived(
     profileStore.isReadOnly
@@ -48,7 +54,7 @@
     <!-- Sidebar -->
     <aside>
       <div class="sidebar-header">
-        <h1>Vault</h1>
+        <h1>Harpocrates</h1>
         <p>Encrypted S3 Manager</p>
       </div>
 
@@ -105,6 +111,9 @@
           <span>⚙</span>
           Settings
         </a>
+        {#if appVersion}
+          <p class="version-label">v{appVersion}</p>
+        {/if}
       </div>
     </aside>
 
@@ -288,6 +297,13 @@
     border-top: 1px solid #e2e8f0;
   }
 
+  .version-label {
+    font-size: 0.6875rem;
+    color: #94a3b8;
+    margin: 0.375rem 0 0;
+    padding: 0 0.375rem;
+  }
+
   .content-area {
     flex: 1;
     display: flex;
@@ -386,6 +402,10 @@
 
     .sidebar-footer {
       border-top-color: #334155;
+    }
+
+    .version-label {
+      color: #475569;
     }
   }
 </style>
