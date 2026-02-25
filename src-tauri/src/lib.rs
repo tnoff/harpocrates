@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use tauri::Manager;
 
 mod backup;
 mod commands;
@@ -8,6 +9,7 @@ mod crypto;
 mod db;
 mod error;
 mod profiles;
+mod queue;
 mod s3;
 mod throttle;
 
@@ -34,12 +36,19 @@ pub fn run() {
         Err(e) => eprintln!("Warning: temp file cleanup failed: {}", e),
     }
 
+    let op_queue = queue::OperationQueue::new();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(db::DbState(Mutex::new(conn)))
         .manage(throttle::global().clone())
-        .manage(commands::BackupCancelState::new())
+        .manage(op_queue)
+        .setup(|app| {
+            let q = app.state::<queue::OperationQueue>();
+            q.start_worker(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Phase 1
             commands::get_table_count,
@@ -56,7 +65,6 @@ pub fn run() {
             // Phase 5: Backup
             commands::backup_file,
             commands::backup_directory,
-            commands::cancel_backup,
             // Phase 6: Restore
             commands::restore_files,
             // Phase 7: Share
@@ -87,6 +95,9 @@ pub fn run() {
             // Throttle
             commands::set_throttle_limits,
             commands::get_throttle_limits,
+            // Queue
+            commands::cancel_operation,
+            commands::get_queue,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

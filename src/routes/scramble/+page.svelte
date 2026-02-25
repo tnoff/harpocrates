@@ -1,65 +1,24 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { selectionStore } from "$lib/stores/selection.svelte";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
-  import { operationsStore } from "$lib/stores/operations.svelte";
-
-  interface ScrambleSummary {
-    files_scrambled: number;
-    manifests_invalidated: number;
-    failed: number;
-    failures: string[];
-  }
-
-  interface ScrambleProgress {
-    processed: number;
-    total: number;
-    current_file: string;
-    scrambled: number;
-    failed: number;
-  }
 
   let scrambleAll = $state(false);
   let showConfirm = $state(false);
-  let running = $state(false);
+  let submitting = $state(false);
 
   async function doScramble() {
     showConfirm = false;
-    running = true;
-
-    const label = scrambleAll
-      ? "Scrambling all files"
-      : `Scrambling ${selectionStore.count} file(s)`;
-    const id = operationsStore.add(label);
-
-    const unlisten = await listen<ScrambleProgress>("scramble:progress", (event) => {
-      const p = event.payload;
-      operationsStore.updateProgress(id, {
-        current: p.processed,
-        total: p.total,
-        detail: p.current_file.split("/").at(-1),
-      });
-    });
-
+    submitting = true;
     try {
-      const summary = await invoke<ScrambleSummary>("scramble", {
+      await invoke("scramble", {
         backupEntryIds: scrambleAll ? [] : selectionStore.array,
         scrambleAll,
       });
-      const parts = [
-        `${summary.files_scrambled} scrambled`,
-        summary.manifests_invalidated > 0
-          ? `${summary.manifests_invalidated} manifests invalidated`
-          : null,
-        summary.failed > 0 ? `${summary.failed} failed` : null,
-      ].filter(Boolean);
-      operationsStore.complete(id, parts.join(", "));
-    } catch (e) {
-      operationsStore.fail(id, String(e));
+    } catch {
+      // enqueue failure is rare; result will appear in StatusFooter
     } finally {
-      unlisten();
-      running = false;
+      submitting = false;
     }
   }
 
@@ -86,10 +45,10 @@
 
   <button
     onclick={() => showConfirm = true}
-    disabled={running || (!scrambleAll && !hasSelection)}
+    disabled={submitting || (!scrambleAll && !hasSelection)}
     class="btn-warning"
   >
-    {running ? "Scrambling..." : "Scramble"}
+    Scramble
   </button>
 
   {#if showConfirm}

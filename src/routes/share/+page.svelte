@@ -1,18 +1,14 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { profileStore } from "$lib/stores/profile.svelte";
   import { selectionStore } from "$lib/stores/selection.svelte";
   import { toast } from "$lib/stores/toast.svelte";
-  import { operationsStore } from "$lib/stores/operations.svelte";
 
   interface ManifestFileEntry { uuid: string; filename: string; size: number; }
   interface ManifestFileList { manifest_uuid: string; files: ManifestFileEntry[]; }
   interface ShareManifest { id: number; profile_id: number; manifest_uuid: string; label: string | null; file_count: number; is_valid: boolean; created_at: string; }
-  interface RestoreSummary { total: number; restored: number; skipped: number; failed: number; failures: { filename: string; error: string }[]; }
-  interface RestoreProgress { processed: number; total: number; current_file: string; restored: number; skipped: number; failed: number; }
 
   let activeTab = $state<"create" | "receive" | "manager">(profileStore.isReadOnly ? "receive" : "create");
 
@@ -73,35 +69,16 @@
     const path = await open({ directory: true });
     if (!path || !manifestFiles) return;
 
-    const count = selectedFileUuids.size;
-    const label = count === 1 ? "Downloading 1 file" : `Downloading ${count} files`;
-    const id = operationsStore.add(label);
-
-    const unlisten = await listen<RestoreProgress>("restore:progress", (event) => {
-      const p = event.payload;
-      operationsStore.updateProgress(id, {
-        current: p.processed,
-        total: p.total,
-        detail: p.current_file.split("/").at(-1),
-      });
-    });
-
     downloading = true;
     try {
-      const summary = await invoke<RestoreSummary>("download_from_manifest", {
+      await invoke("download_from_manifest", {
         manifestUuid: manifestFiles.manifest_uuid,
         selectedUuids: [...selectedFileUuids],
         saveDirectory: path,
       });
-      const parts = [
-        `${summary.restored} downloaded`,
-        summary.failed > 0 ? `${summary.failed} failed` : null,
-      ].filter(Boolean);
-      operationsStore.complete(id, parts.join(", "));
     } catch (e) {
-      operationsStore.fail(id, String(e));
+      toast.error(String(e));
     } finally {
-      unlisten();
       downloading = false;
     }
   }

@@ -1,36 +1,17 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { operationsStore } from "$lib/stores/operations.svelte";
-
-  interface RestoreSummary {
-    total: number;
-    restored: number;
-    skipped: number;
-    failed: number;
-    failures: { filename: string; error: string }[];
-  }
-
-  interface RestoreProgress {
-    processed: number;
-    total: number;
-    current_file: string;
-    restored: number;
-    skipped: number;
-    failed: number;
-  }
 
   interface Props {
     selectedIds: number[];
     onclose: () => void;
-    oncomplete?: () => void;
   }
 
-  let { selectedIds, onclose, oncomplete }: Props = $props();
+  let { selectedIds, onclose }: Props = $props();
 
   let useCustomDir = $state(false);
   let targetDir = $state("");
+  let error = $state("");
 
   async function pickDirectory() {
     const path = await open({ directory: true });
@@ -38,39 +19,15 @@
   }
 
   async function restore() {
-    const label =
-      selectedIds.length === 1
-        ? "Restoring 1 file"
-        : `Restoring ${selectedIds.length} files`;
-    const id = operationsStore.add(label);
-
-    const unlisten = await listen<RestoreProgress>("restore:progress", (event) => {
-      const p = event.payload;
-      operationsStore.updateProgress(id, {
-        current: p.processed,
-        total: p.total,
-        detail: p.current_file.split("/").at(-1),
-      });
-    });
-
-    onclose();
-
+    error = "";
     try {
-      const summary = await invoke<RestoreSummary>("restore_files", {
+      await invoke("restore_files", {
         backupEntryIds: selectedIds,
         targetDirectory: useCustomDir && targetDir ? targetDir : null,
       });
-      const parts = [
-        `${summary.restored} restored`,
-        summary.skipped > 0 ? `${summary.skipped} skipped` : null,
-        summary.failed > 0 ? `${summary.failed} failed` : null,
-      ].filter(Boolean);
-      operationsStore.complete(id, parts.join(", "));
-      oncomplete?.();
+      onclose();
     } catch (e) {
-      operationsStore.fail(id, String(e));
-    } finally {
-      unlisten();
+      error = String(e);
     }
   }
 </script>
@@ -109,6 +66,10 @@
         </div>
       {/if}
 
+      {#if error}
+        <p class="error-text">{error}</p>
+      {/if}
+
       <div class="btn-row">
         <button onclick={restore} disabled={useCustomDir && !targetDir} class="btn-primary flex-1">
           Restore
@@ -144,6 +105,7 @@
     background: white; font-size: 0.875rem; outline: none;
   }
 
+  .error-text { font-size: 0.8125rem; color: #ef4444; margin: 0; }
   .btn-row { display: flex; gap: 0.75rem; }
 
   .btn-primary {

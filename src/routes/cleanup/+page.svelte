@@ -5,7 +5,6 @@
 
   interface OrphanedLocalEntry { local_file_id: number; backup_entry_id: number; local_path: string; }
   interface OrphanedS3Object { key: string; size: number; }
-  interface CleanupSummary { deleted_count: number; details: string[]; }
 
   let activeTab = $state<"local" | "s3">("local");
 
@@ -13,15 +12,13 @@
   let localOrphans = $state<OrphanedLocalEntry[]>([]);
   let selectedLocalIds = $state<Set<number>>(new Set());
   let scanningLocal = $state(false);
-  let cleaningLocal = $state(false);
+  let submittingLocal = $state(false);
   let localDryRun = $state(true);
   let deleteS3 = $state(false);
-  let localSummary = $state<CleanupSummary | null>(null);
   let showLocalConfirm = $state(false);
 
   async function scanLocal() {
     scanningLocal = true;
-    localSummary = null;
     try {
       localOrphans = await invoke<OrphanedLocalEntry[]>("scan_orphaned_local_entries");
       selectedLocalIds = new Set(localOrphans.map(o => o.local_file_id));
@@ -40,9 +37,9 @@
 
   async function cleanupLocal() {
     showLocalConfirm = false;
-    cleaningLocal = true;
+    submittingLocal = true;
     try {
-      localSummary = await invoke<CleanupSummary>("cleanup_orphaned_local_entries", {
+      await invoke("cleanup_orphaned_local_entries", {
         localFileIds: [...selectedLocalIds],
         deleteS3: deleteS3,
         dryRun: localDryRun,
@@ -50,7 +47,7 @@
     } catch (e) {
       toast.error(String(e));
     } finally {
-      cleaningLocal = false;
+      submittingLocal = false;
     }
   }
 
@@ -58,14 +55,12 @@
   let s3Orphans = $state<OrphanedS3Object[]>([]);
   let selectedS3Keys = $state<Set<string>>(new Set());
   let scanningS3 = $state(false);
-  let cleaningS3 = $state(false);
+  let submittingS3 = $state(false);
   let s3DryRun = $state(true);
-  let s3Summary = $state<CleanupSummary | null>(null);
   let showS3Confirm = $state(false);
 
   async function scanS3() {
     scanningS3 = true;
-    s3Summary = null;
     try {
       s3Orphans = await invoke<OrphanedS3Object[]>("scan_orphaned_s3_objects");
       selectedS3Keys = new Set(s3Orphans.map(o => o.key));
@@ -84,16 +79,16 @@
 
   async function cleanupS3() {
     showS3Confirm = false;
-    cleaningS3 = true;
+    submittingS3 = true;
     try {
-      s3Summary = await invoke<CleanupSummary>("cleanup_orphaned_s3_objects", {
+      await invoke("cleanup_orphaned_s3_objects", {
         objectKeys: [...selectedS3Keys],
         dryRun: s3DryRun,
       });
     } catch (e) {
       toast.error(String(e));
     } finally {
-      cleaningS3 = false;
+      submittingS3 = false;
     }
   }
 
@@ -158,27 +153,15 @@
           </label>
           <button
             onclick={() => showLocalConfirm = true}
-            disabled={cleaningLocal || selectedLocalIds.size === 0}
+            disabled={submittingLocal || selectedLocalIds.size === 0}
             class="btn-danger"
           >
-            {cleaningLocal ? "Cleaning..." : `Delete ${selectedLocalIds.size} entries`}
+            {`Delete ${selectedLocalIds.size} entries${localDryRun ? " (dry run)" : ""}`}
           </button>
         </div>
 
       {:else if !scanningLocal}
         <p class="muted-text">No orphaned local entries found. Click scan to check.</p>
-      {/if}
-
-      {#if localSummary}
-        <div class="result-box">
-          <p class="result-heading">{localDryRun ? "Dry Run Results" : "Cleanup Complete"}</p>
-          <p class="result-text">Deleted: {localSummary.deleted_count}</p>
-          {#if localSummary.details.length > 0}
-            <ul class="details-list">
-              {#each localSummary.details as d}<li>{d}</li>{/each}
-            </ul>
-          {/if}
-        </div>
       {/if}
     </div>
   {/if}
@@ -226,27 +209,15 @@
           </label>
           <button
             onclick={() => showS3Confirm = true}
-            disabled={cleaningS3 || selectedS3Keys.size === 0}
+            disabled={submittingS3 || selectedS3Keys.size === 0}
             class="btn-danger"
           >
-            {cleaningS3 ? "Cleaning..." : `Delete ${selectedS3Keys.size} objects`}
+            {`Delete ${selectedS3Keys.size} objects${s3DryRun ? " (dry run)" : ""}`}
           </button>
         </div>
 
       {:else if !scanningS3}
         <p class="muted-text">No orphaned S3 objects found. Click scan to check.</p>
-      {/if}
-
-      {#if s3Summary}
-        <div class="result-box">
-          <p class="result-heading">{s3DryRun ? "Dry Run Results" : "Cleanup Complete"}</p>
-          <p class="result-text">Deleted: {s3Summary.deleted_count}</p>
-          {#if s3Summary.details.length > 0}
-            <ul class="details-list">
-              {#each s3Summary.details as d}<li>{d}</li>{/each}
-            </ul>
-          {/if}
-        </div>
       {/if}
     </div>
   {/if}
@@ -381,36 +352,6 @@
     cursor: pointer;
   }
 
-  /* Result box */
-  .result-box {
-    background: #f0fdf4;
-    border: 1px solid #86efac;
-    border-radius: 0.5rem;
-    padding: 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-  }
-
-  .result-heading {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: #166534;
-    margin: 0;
-  }
-
-  .result-text { font-size: 0.875rem; margin: 0; }
-
-  .details-list {
-    font-size: 0.75rem;
-    color: #64748b;
-    margin: 0.25rem 0 0 1rem;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.125rem;
-  }
-
   .muted-text { font-size: 0.875rem; color: #64748b; margin: 0; }
 
   /* Buttons */
@@ -456,8 +397,6 @@
     th { color: #94a3b8; border-bottom-color: #334155; }
     tbody tr { border-bottom-color: #0f172a; }
     tbody tr:hover { background: rgb(30 41 59 / 0.5); }
-    .result-box { background: rgb(21 128 61 / 0.1); border-color: rgb(21 128 61 / 0.4); }
-    .result-heading { color: #4ade80; }
-    .details-list, .muted-text { color: #94a3b8; }
+    .muted-text { color: #94a3b8; }
   }
 </style>

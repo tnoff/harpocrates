@@ -4,8 +4,8 @@
   import { toast } from "$lib/stores/toast.svelte";
 
   interface VerifyResult { backup_entry_id: number; filename: string; status: string; detail: string | null; }
-  interface VerifySummary { passed: number; failed: number; errors: number; results: VerifyResult[]; }
-  interface VerifyProgress { processed: number; total: number; current_file: string; passed: number; failed: number; errors: number; }
+  interface VerifyProgress { op_id: string; processed: number; total: number; current_file: string; passed: number; failed: number; errors: number; }
+  interface VerifyComplete { op_id: string; passed: number; failed: number; errors: number; results: VerifyResult[]; }
 
   interface Props {
     selectedIds: number[];
@@ -14,32 +14,56 @@
 
   let { selectedIds, onclose }: Props = $props();
 
-  let running = $state(true);
-  let summary = $state<VerifySummary | null>(null);
+  let queued = $state(false);
+  let running = $state(false);
+  let summary = $state<VerifyComplete | null>(null);
   let progress = $state<VerifyProgress | null>(null);
+  let errorMsg = $state("");
 
   $effect(() => {
-    verify();
+    let cleanups: (() => void)[] = [];
+
+    (async () => {
+      let opId: string;
+      try {
+        opId = await invoke<string>("verify_integrity", { backupEntryIds: selectedIds });
+        queued = true;
+      } catch (e) {
+        toast.error(String(e));
+        return;
+      }
+
+      const ul1 = await listen<VerifyProgress>("verify:progress", (event) => {
+        if (event.payload.op_id !== opId) return;
+        if (!running) { queued = false; running = true; }
+        progress = event.payload;
+      });
+
+      const ul2 = await listen<VerifyComplete>("verify:complete", (event) => {
+        if (event.payload.op_id !== opId) return;
+        queued = false;
+        running = false;
+        summary = event.payload;
+        cleanups.forEach((f) => f());
+        cleanups = [];
+      });
+
+      const ul3 = await listen<{ id: string; error: string }>("op:failed", (event) => {
+        if (event.payload.id !== opId) return;
+        queued = false;
+        running = false;
+        errorMsg = event.payload.error;
+        cleanups.forEach((f) => f());
+        cleanups = [];
+      });
+
+      cleanups = [ul1, ul2, ul3];
+    })();
+
+    return () => {
+      cleanups.forEach((f) => f());
+    };
   });
-
-  async function verify() {
-    running = true;
-    progress = null;
-
-    const unlisten = await listen<VerifyProgress>("verify:progress", (event) => {
-      progress = event.payload;
-    });
-
-    try {
-      summary = await invoke<VerifySummary>("verify_integrity", { backupEntryIds: selectedIds });
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      unlisten();
-      running = false;
-      progress = null;
-    }
-  }
 
   function statusColor(status: string): string {
     if (status === "passed" || status === "ok") return "status-passed";
@@ -61,7 +85,15 @@
   >
     <h3 id="verify-title" class="dialog-title">Verify Integrity</h3>
 
-    {#if running}
+    {#if errorMsg}
+      <p class="error-text">{errorMsg}</p>
+
+    {:else if queued && !running}
+      <div class="section">
+        <p class="muted-text">Waiting in queue...</p>
+      </div>
+
+    {:else if running}
       <div class="section">
         {#if progress}
           <div class="progress-section">
@@ -188,6 +220,7 @@
   .text-warning { color: #f59e0b; }
 
   .muted-text { font-size: 0.875rem; color: #64748b; margin: 0; }
+  .error-text { font-size: 0.875rem; color: #ef4444; margin: 0; }
 
   .badge-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
 

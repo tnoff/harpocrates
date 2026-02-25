@@ -1,40 +1,18 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
-  import { operationsStore } from "$lib/stores/operations.svelte";
-
-  interface BackupSummary {
-    total_files: number;
-    processed: number;
-    skipped: number;
-    uploaded: number;
-    deduped: number;
-    failed: number;
-    failures: { path: string; error: string }[];
-  }
-
-  interface BackupProgress {
-    processed: number;
-    total: number;
-    uploaded: number;
-    deduped: number;
-    skipped: number;
-    failed: number;
-    current_file: string;
-  }
 
   interface Props {
     onclose: () => void;
-    oncomplete?: () => void;
   }
 
-  let { onclose, oncomplete }: Props = $props();
+  let { onclose }: Props = $props();
 
   let dirPath = $state("");
   let skipPatterns = $state<string[]>([]);
   let newPattern = $state("");
   let forceChecksum = $state(false);
+  let error = $state("");
 
   async function pickDirectory() {
     const path = await open({ directory: true });
@@ -55,43 +33,12 @@
 
   async function startBackup() {
     if (!dirPath) return;
-
-    const dirname = dirPath.split("/").at(-1) ?? dirPath;
-    const id = operationsStore.add(`Backing up ${dirname}`, {
-      oncancel: () => invoke("cancel_backup"),
-    });
-
-    // Register listener before closing modal so no events are missed
-    const unlisten = await listen<BackupProgress>("backup:progress", (event) => {
-      const p = event.payload;
-      operationsStore.updateProgress(id, {
-        current: p.processed,
-        total: p.total,
-        detail: p.current_file.split("/").at(-1),
-      });
-    });
-
-    // Close modal immediately — operation continues in the background
-    onclose();
-
+    error = "";
     try {
-      const summary = await invoke<BackupSummary>("backup_directory", {
-        dirPath,
-        skipPatterns,
-        forceChecksum,
-      });
-      const parts = [
-        `${summary.uploaded} uploaded`,
-        summary.deduped > 0 ? `${summary.deduped} deduped` : null,
-        summary.skipped > 0 ? `${summary.skipped} skipped` : null,
-        summary.failed > 0 ? `${summary.failed} failed` : null,
-      ].filter(Boolean);
-      operationsStore.complete(id, parts.join(", "));
-      oncomplete?.();
+      await invoke("backup_directory", { dirPath, skipPatterns, forceChecksum });
+      onclose();
     } catch (e) {
-      operationsStore.fail(id, String(e));
-    } finally {
-      unlisten();
+      error = String(e);
     }
   }
 </script>
@@ -146,6 +93,10 @@
         <input type="checkbox" bind:checked={forceChecksum} />
         Force checksum (re-upload even if size/mtime match)
       </label>
+
+      {#if error}
+        <p class="error-text">{error}</p>
+      {/if}
 
       <div class="btn-row">
         <button onclick={startBackup} disabled={!dirPath} class="btn-primary flex-1">Start Backup</button>
@@ -207,6 +158,8 @@
 
   .checkbox-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; cursor: pointer; }
   .btn-row { display: flex; gap: 0.75rem; }
+
+  .error-text { font-size: 0.8125rem; color: #ef4444; margin: 0; }
 
   .btn-primary {
     padding: 0.5rem 1rem; background: #3b82f6; color: white;

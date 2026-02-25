@@ -6,7 +6,6 @@
   import { selectionStore } from "$lib/stores/selection.svelte";
   import { profileStore } from "$lib/stores/profile.svelte";
   import { toast } from "$lib/stores/toast.svelte";
-  import { operationsStore } from "$lib/stores/operations.svelte";
 
   interface FileEntry {
     id: number;
@@ -51,14 +50,12 @@
   async function backupFile() {
     const path = await open({ multiple: false });
     if (!path) return;
-    const filename = (path as string).split("/").at(-1) ?? path;
-    const id = operationsStore.add(`Backing up ${filename}`);
     try {
       await invoke("backup_file", { filePath: path });
-      operationsStore.complete(id, "Backed up successfully");
+      toast.success("File backed up successfully");
       await loadFiles();
     } catch (e) {
-      operationsStore.fail(id, String(e));
+      toast.error(String(e));
     }
   }
 
@@ -123,10 +120,7 @@
 
   {#if showBackupDir}
     {#await import("$lib/components/BackupDirectoryModal.svelte") then mod}
-      <mod.default
-        onclose={() => { showBackupDir = false; }}
-        oncomplete={loadFiles}
-      />
+      <mod.default onclose={() => { showBackupDir = false; }} />
     {/await}
   {/if}
 
@@ -135,7 +129,6 @@
       <mod.default
         selectedIds={selectionStore.array}
         onclose={() => { showRestore = false; }}
-        oncomplete={loadFiles}
       />
     {/await}
   {/if}

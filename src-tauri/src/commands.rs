@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
-use tauri::{Emitter, State};
+use tauri::State;
 
 use crate::backup;
 use crate::credentials;
@@ -11,58 +9,8 @@ use crate::crypto;
 use crate::db::{self, DbState};
 use crate::error::AppError;
 use crate::profiles;
+use crate::queue::{OperationQueue, OpParams, QueueSnapshot};
 use crate::s3::S3Client;
-
-// ── Backup cancel & progress ─────────────────────────────────────────────────
-
-pub struct BackupCancelState(Arc<AtomicBool>);
-
-impl BackupCancelState {
-    pub fn new() -> Self { Self(Arc::new(AtomicBool::new(false))) }
-    pub fn reset(&self)  { self.0.store(false, Ordering::Relaxed); }
-    pub fn cancel(&self) { self.0.store(true,  Ordering::Relaxed); }
-    pub fn is_cancelled(&self) -> bool { self.0.load(Ordering::Relaxed) }
-}
-
-#[derive(serde::Serialize, Clone)]
-struct BackupProgressEvent {
-    processed: usize,
-    total: usize,
-    uploaded: usize,
-    deduped: usize,
-    skipped: usize,
-    failed: usize,
-    current_file: String,
-}
-
-#[derive(serde::Serialize, Clone)]
-struct VerifyProgressEvent {
-    processed: usize,
-    total: usize,
-    current_file: String,
-    passed: usize,
-    failed: usize,
-    errors: usize,
-}
-
-#[derive(serde::Serialize, Clone)]
-struct RestoreProgressEvent {
-    processed: usize,
-    total: usize,
-    current_file: String,
-    restored: usize,
-    skipped: usize,
-    failed: usize,
-}
-
-#[derive(serde::Serialize, Clone)]
-struct ScrambleProgressEvent {
-    processed: usize,
-    total: usize,
-    current_file: String,
-    scrambled: usize,
-    failed: usize,
-}
 
 // ══════════════════════════════════════════════════════
 // Helpers
@@ -275,6 +223,26 @@ pub async fn test_connection_params(
 }
 
 // ══════════════════════════════════════════════════════
+// Queue management
+// ══════════════════════════════════════════════════════
+
+/// Cancel a queued or active operation.
+#[tauri::command]
+pub fn cancel_operation(
+    queue: State<'_, OperationQueue>,
+    op_id: String,
+) -> Result<(), AppError> {
+    queue.cancel(&op_id);
+    Ok(())
+}
+
+/// Return the current queue snapshot (pending + active).
+#[tauri::command]
+pub fn get_queue(queue: State<'_, OperationQueue>) -> Result<QueueSnapshot, AppError> {
+    Ok(queue.snapshot())
+}
+
+// ══════════════════════════════════════════════════════
 // Phase 5: Backup
 // ══════════════════════════════════════════════════════
 
@@ -375,301 +343,45 @@ pub async fn backup_file(db: State<'_, DbState>, file_path: String) -> Result<ba
     })
 }
 
+/// Enqueue a directory backup. Returns the op ID immediately.
 #[tauri::command]
-pub async fn backup_directory(
-    app: tauri::AppHandle,
-    db: State<'_, DbState>,
-    cancel: State<'_, BackupCancelState>,
+pub fn backup_directory(
+    queue: State<'_, OperationQueue>,
     dir_path: String,
     skip_patterns: Vec<String>,
     force_checksum: bool,
-) -> Result<backup::BackupSummary, AppError> {
-    cancel.reset();
-
-    let profile = {
-        let conn = db.conn()?;
-        get_active_profile_or_err(&conn)?
-    };
-
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
-    let s3 = build_s3_client(&profile).await?;
-
-    let regexes: Vec<regex::Regex> = skip_patterns
-        .iter()
-        .map(|p| regex::Regex::new(p))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| AppError::Config(format!("Invalid skip pattern: {}", e)))?;
-
-    // Scan directory (sync)
-    let files = backup::scan_directory(Path::new(&dir_path), &regexes)?;
-    let total_files = files.len();
-    let mut summary = backup::BackupSummary {
-        total_files,
-        ..Default::default()
-    };
-
-    for file_path in &files {
-        if cancel.is_cancelled() {
-            break;
-        }
-
-        let full_path_str = file_path.to_string_lossy().to_string();
-        let stored_path = backup::strip_relative_path(&full_path_str, profile.relative_path.as_deref());
-
-        // Emit progress at start of each file so the UI stays responsive
-        let _ = app.emit("backup:progress", BackupProgressEvent {
-            processed: summary.processed,
-            total: summary.total_files,
-            uploaded: summary.uploaded,
-            deduped: summary.deduped,
-            skipped: summary.skipped,
-            failed: summary.failed,
-            current_file: full_path_str.clone(),
-        });
-
-        let metadata = match std::fs::metadata(file_path) {
-            Ok(m) => m,
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(backup::BackupFailure { path: full_path_str, error: e.to_string() });
-                summary.processed += 1;
-                continue;
-            }
-        };
-        let current_mtime = metadata.modified().ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64());
-        let current_size = Some(metadata.len() as i64);
-
-        // Change detection — needs DB lock (short scope)
-        if !force_checksum {
-            let skip = {
-                let conn = db.conn()?;
-                let mut stmt = conn.prepare(
-                    "SELECT lf.cached_mtime, lf.cached_size
-                     FROM local_file lf JOIN backup_entry be ON lf.backup_entry_id = be.id
-                     WHERE be.profile_id = ?1 AND lf.local_path = ?2 LIMIT 1",
-                )?;
-                stmt.query_row(rusqlite::params![profile.id, stored_path], |row: &rusqlite::Row| {
-                    let cached_mtime: Option<f64> = row.get(0)?;
-                    let cached_size: Option<i64> = row.get(1)?;
-                    let mtime_match = match (cached_mtime, current_mtime) {
-                        (Some(c), Some(n)) => (c - n).abs() < 0.001,
-                        _ => false,
-                    };
-                    Ok(mtime_match && cached_size == current_size)
-                }).optional()?.unwrap_or(false)
-            };
-
-            if skip {
-                summary.skipped += 1;
-                summary.processed += 1;
-                continue;
-            }
-        }
-
-        // Compute MD5
-        let original_md5 = match crypto::compute_file_md5(file_path) {
-            Ok(md5) => md5,
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(backup::BackupFailure { path: full_path_str, error: e.to_string() });
-                summary.processed += 1;
-                continue;
-            }
-        };
-
-        // Dedup check (short DB lock)
-        let existing_entry = {
-            let conn = db.conn()?;
-            let mut stmt = conn.prepare(
-                "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
-                 FROM backup_entry WHERE profile_id = ?1 AND original_md5 = ?2 LIMIT 1",
-            )?;
-            stmt.query_row(rusqlite::params![profile.id, original_md5], |row: &rusqlite::Row| {
-                Ok(db::BackupEntry {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    object_uuid: row.get(2)?,
-                    original_md5: row.get(3)?,
-                    encrypted_md5: row.get(4)?,
-                    file_size: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            }).optional()?
-        };
-
-        if let Some(entry) = existing_entry {
-            // Dedup — just insert local_file
-            let conn = db.conn()?;
-            db::insert_local_file(&conn, entry.id, &stored_path, current_mtime, current_size)?;
-            summary.deduped += 1;
-            summary.processed += 1;
-            continue;
-        }
-
-        // Encrypt + upload
-        let temp_path = crypto::generate_temp_path(&temp_dir);
-        let encrypt_result = match crypto::encrypt_file(file_path, &temp_path, &encryption_key) {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                summary.failed += 1;
-                summary.failures.push(backup::BackupFailure { path: full_path_str, error: e.to_string() });
-                summary.processed += 1;
-                continue;
-            }
-        };
-
-        let object_uuid = uuid::Uuid::new_v4().to_string();
-        let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
-        let _ = std::fs::remove_file(&temp_path);
-
-        match upload_result {
-            Ok(()) => {
-                let conn = db.conn()?;
-                let entry_id = db::insert_backup_entry(
-                    &conn, profile.id, &object_uuid,
-                    &encrypt_result.original_md5, &encrypt_result.encrypted_md5,
-                    encrypt_result.file_size as i64,
-                )?;
-                db::insert_local_file(&conn, entry_id, &stored_path, current_mtime, current_size)?;
-                summary.uploaded += 1;
-            }
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(backup::BackupFailure { path: full_path_str, error: e.to_string() });
-            }
-        }
-        summary.processed += 1;
-    }
-
-    Ok(summary)
-}
-
-#[tauri::command]
-pub fn cancel_backup(cancel: State<BackupCancelState>) -> Result<(), AppError> {
-    cancel.cancel();
-    Ok(())
+) -> Result<String, AppError> {
+    let dirname = Path::new(&dir_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir_path.clone());
+    let id = queue.enqueue(
+        format!("Backing up {}", dirname),
+        "backup",
+        OpParams::BackupDirectory { dir_path, skip_patterns, force_checksum },
+    );
+    Ok(id)
 }
 
 // ══════════════════════════════════════════════════════
 // Phase 6: Restore
 // ══════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct RestoreSummary {
-    pub total: usize,
-    pub restored: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub failures: Vec<RestoreFailure>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RestoreFailure {
-    pub filename: String,
-    pub error: String,
-}
-
+/// Enqueue a restore operation. Returns the op ID immediately.
 #[tauri::command]
-pub async fn restore_files(
-    app: tauri::AppHandle,
-    db: State<'_, DbState>,
+pub fn restore_files(
+    queue: State<'_, OperationQueue>,
     backup_entry_ids: Vec<i64>,
     target_directory: Option<String>,
-) -> Result<RestoreSummary, AppError> {
-    let (profile, entries) = {
-        let conn = db.conn()?;
-        let profile = get_active_profile_or_err(&conn)?;
-        let mut entries = Vec::new();
-        for id in &backup_entry_ids {
-            if let Some(entry) = db::get_backup_entry_by_id(&conn, *id)? {
-                let local_files = db::list_local_files(&conn, entry.id)?;
-                let path = local_files.first().map(|lf| lf.local_path.clone());
-                entries.push((entry, path));
-            }
-        }
-        (profile, entries)
+) -> Result<String, AppError> {
+    let count = backup_entry_ids.len();
+    let label = if count == 1 {
+        "Restoring 1 file".into()
+    } else {
+        format!("Restoring {} files", count)
     };
-
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
-    let s3 = build_s3_client(&profile).await?;
-
-    let mut summary = RestoreSummary { total: entries.len(), ..Default::default() };
-
-    for (entry, stored_path) in &entries {
-        let current_filename = stored_path.as_ref()
-            .and_then(|p| Path::new(p).file_name())
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| entry.object_uuid.clone());
-        let _ = app.emit("restore:progress", RestoreProgressEvent {
-            processed: summary.restored + summary.skipped + summary.failed,
-            total: summary.total,
-            current_file: current_filename,
-            restored: summary.restored,
-            skipped: summary.skipped,
-            failed: summary.failed,
-        });
-
-        let target_path = match &target_directory {
-            Some(dir) => {
-                let filename = stored_path.as_ref()
-                    .and_then(|p| Path::new(p).file_name())
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| entry.object_uuid.clone());
-                PathBuf::from(dir).join(filename)
-            }
-            None => match stored_path {
-                Some(sp) => backup::expand_relative_path(sp, profile.relative_path.as_deref()),
-                None => {
-                    summary.failed += 1;
-                    summary.failures.push(RestoreFailure {
-                        filename: entry.object_uuid.clone(),
-                        error: "No local path recorded".into(),
-                    });
-                    continue;
-                }
-            },
-        };
-
-        // Check if already restored
-        if target_path.exists() {
-            if let Ok(md5) = crypto::compute_file_md5(&target_path) {
-                if md5 == entry.original_md5 {
-                    summary.skipped += 1;
-                    continue;
-                }
-            }
-        }
-
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-
-        let temp_encrypted = crypto::generate_temp_path(&temp_dir);
-        if let Err(e) = s3.download_object(&entry.object_uuid, &temp_encrypted).await {
-            let _ = std::fs::remove_file(&temp_encrypted);
-            summary.failed += 1;
-            summary.failures.push(RestoreFailure { filename: target_path.to_string_lossy().into(), error: e.to_string() });
-            continue;
-        }
-
-        let result = crypto::decrypt_file(&temp_encrypted, &target_path, &encryption_key);
-        let _ = std::fs::remove_file(&temp_encrypted);
-
-        match result {
-            Ok(()) => summary.restored += 1,
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(RestoreFailure { filename: target_path.to_string_lossy().into(), error: e.to_string() });
-            }
-        }
-    }
-
-    Ok(summary)
+    let id = queue.enqueue(label, "restore", OpParams::RestoreFiles { backup_entry_ids, target_directory });
+    Ok(id)
 }
 
 // ══════════════════════════════════════════════════════
@@ -785,83 +497,28 @@ pub async fn receive_manifest(
     Ok(ManifestFileList { manifest_uuid, files })
 }
 
+/// Enqueue a manifest download. Returns the op ID immediately.
 #[tauri::command]
-pub async fn download_from_manifest(
-    app: tauri::AppHandle,
-    db: State<'_, DbState>,
+pub fn download_from_manifest(
+    queue: State<'_, OperationQueue>,
     manifest_uuid: String,
     selected_uuids: Vec<String>,
     save_directory: String,
-) -> Result<RestoreSummary, AppError> {
-    let profile = {
-        let conn = db.conn()?;
-        get_active_profile_or_err(&conn)?
-    };
-
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
-    let s3 = build_s3_client(&profile).await?;
-
-    let temp_encrypted = crypto::generate_temp_path(&temp_dir);
-    let temp_decrypted = crypto::generate_temp_path(&temp_dir);
-
-    s3.download_object(&manifest_uuid, &temp_encrypted).await?;
-    crypto::decrypt_file(&temp_encrypted, &temp_decrypted, &encryption_key)?;
-    let _ = std::fs::remove_file(&temp_encrypted);
-
-    let manifest_json = std::fs::read_to_string(&temp_decrypted)?;
-    let _ = std::fs::remove_file(&temp_decrypted);
-
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
-    let files: Vec<ManifestFileEntry> = serde_json::from_value(
-        manifest.get("files").ok_or_else(|| AppError::InvalidData("manifest is missing 'files' key".into()))?.clone(),
-    )?;
-
-    let to_download: Vec<&ManifestFileEntry> = if selected_uuids.is_empty() {
-        files.iter().collect()
+) -> Result<String, AppError> {
+    let count = selected_uuids.len();
+    let label = if count == 0 {
+        "Downloading shared files".into()
+    } else if count == 1 {
+        "Downloading 1 file".into()
     } else {
-        files.iter().filter(|f| selected_uuids.contains(&f.uuid)).collect()
+        format!("Downloading {} files", count)
     };
-
-    let save_dir = Path::new(&save_directory);
-    std::fs::create_dir_all(save_dir)?;
-
-    let mut summary = RestoreSummary { total: to_download.len(), ..Default::default() };
-
-    for file_entry in to_download {
-        let _ = app.emit("restore:progress", RestoreProgressEvent {
-            processed: summary.restored + summary.skipped + summary.failed,
-            total: summary.total,
-            current_file: file_entry.filename.clone(),
-            restored: summary.restored,
-            skipped: summary.skipped,
-            failed: summary.failed,
-        });
-
-        let target_path = save_dir.join(&file_entry.filename);
-        let temp_enc = crypto::generate_temp_path(&temp_dir);
-
-        match s3.download_object(&file_entry.uuid, &temp_enc).await {
-            Ok(()) => {
-                let result = crypto::decrypt_file(&temp_enc, &target_path, &encryption_key);
-                let _ = std::fs::remove_file(&temp_enc);
-                match result {
-                    Ok(()) => summary.restored += 1,
-                    Err(e) => {
-                        summary.failed += 1;
-                        summary.failures.push(RestoreFailure { filename: file_entry.filename.clone(), error: e.to_string() });
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_enc);
-                summary.failed += 1;
-                summary.failures.push(RestoreFailure { filename: file_entry.filename.clone(), error: e.to_string() });
-            }
-        }
-    }
-
-    Ok(summary)
+    let id = queue.enqueue(
+        label,
+        "download",
+        OpParams::DownloadManifest { manifest_uuid, selected_uuids, save_directory },
+    );
+    Ok(id)
 }
 
 #[tauri::command]
@@ -906,88 +563,21 @@ pub async fn revoke_share_manifest(db: State<'_, DbState>, manifest_id: i64) -> 
 // Phase 8: Scramble
 // ══════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct ScrambleSummary {
-    pub files_scrambled: usize,
-    pub manifests_invalidated: usize,
-    pub failed: usize,
-    pub failures: Vec<String>,
-}
-
+/// Enqueue a scramble operation. Returns the op ID immediately.
 #[tauri::command]
-pub async fn scramble(
-    app: tauri::AppHandle,
-    db: State<'_, DbState>,
+pub fn scramble(
+    queue: State<'_, OperationQueue>,
     backup_entry_ids: Vec<i64>,
     scramble_all: bool,
-) -> Result<ScrambleSummary, AppError> {
-    let (profile, entries) = {
-        let conn = db.conn()?;
-        let profile = get_active_profile_or_err(&conn)?;
-        let entries = if scramble_all {
-            db::list_backup_entries(&conn, profile.id)?
-        } else {
-            let mut e = Vec::new();
-            for id in &backup_entry_ids {
-                if let Some(entry) = db::get_backup_entry_by_id(&conn, *id)? {
-                    e.push(entry);
-                }
-            }
-            e
-        };
-        (profile, entries)
+) -> Result<String, AppError> {
+    let label = if scramble_all {
+        "Scrambling all files".into()
+    } else {
+        let count = backup_entry_ids.len();
+        if count == 1 { "Scrambling 1 file".into() } else { format!("Scrambling {} files", count) }
     };
-
-    let s3 = build_s3_client(&profile).await?;
-    let mut summary = ScrambleSummary::default();
-    let mut scrambled_entry_ids = Vec::new();
-
-    for entry in &entries {
-        let _ = app.emit("scramble:progress", ScrambleProgressEvent {
-            processed: summary.files_scrambled + summary.failed,
-            total: entries.len(),
-            current_file: entry.object_uuid[..8].to_string() + "...",
-            scrambled: summary.files_scrambled,
-            failed: summary.failed,
-        });
-
-        let new_uuid = uuid::Uuid::new_v4().to_string();
-        match s3.copy_object(&entry.object_uuid, &new_uuid).await {
-            Ok(()) => match s3.delete_object(&entry.object_uuid).await {
-                Ok(()) => {
-                    let conn = db.conn()?;
-                    db::update_backup_entry_uuid(&conn, entry.id, &new_uuid)?;
-                    summary.files_scrambled += 1;
-                    scrambled_entry_ids.push(entry.id);
-                }
-                Err(e) => {
-                    s3.delete_object(&new_uuid).await.ok();
-                    summary.failed += 1;
-                    summary.failures.push(format!("Delete old {}: {}", entry.object_uuid, e));
-                }
-            },
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(format!("Copy {}: {}", entry.object_uuid, e));
-            }
-        }
-    }
-
-    // Invalidate affected manifests
-    if !scrambled_entry_ids.is_empty() {
-        let conn = db.conn()?;
-        let manifests = db::list_share_manifests(&conn, profile.id)?;
-        for manifest in &manifests {
-            if !manifest.is_valid { continue; }
-            let entries = db::list_share_manifest_entries(&conn, manifest.id)?;
-            if entries.iter().any(|e| scrambled_entry_ids.contains(&e.backup_entry_id)) {
-                db::invalidate_share_manifest(&conn, manifest.id)?;
-                summary.manifests_invalidated += 1;
-            }
-        }
-    }
-
-    Ok(summary)
+    let id = queue.enqueue(label, "scramble", OpParams::Scramble { backup_entry_ids, scramble_all });
+    Ok(id)
 }
 
 // ══════════════════════════════════════════════════════
@@ -1007,11 +597,6 @@ pub struct OrphanedS3Object {
     pub size: i64,
 }
 
-#[derive(Debug, Default, serde::Serialize)]
-pub struct CleanupSummary {
-    pub deleted_count: usize,
-    pub details: Vec<String>,
-}
 
 #[tauri::command]
 pub fn scan_orphaned_local_entries(db: State<DbState>) -> Result<Vec<OrphanedLocalEntry>, AppError> {
@@ -1042,65 +627,26 @@ pub fn scan_orphaned_local_entries(db: State<DbState>) -> Result<Vec<OrphanedLoc
     Ok(orphans)
 }
 
+/// Enqueue a local orphan cleanup. Returns the op ID immediately.
 #[tauri::command]
-pub async fn cleanup_orphaned_local_entries(
-    db: State<'_, DbState>,
+pub fn cleanup_orphaned_local_entries(
+    queue: State<'_, OperationQueue>,
     local_file_ids: Vec<i64>,
     delete_s3: bool,
     dry_run: bool,
-) -> Result<CleanupSummary, AppError> {
-    let mut summary = CleanupSummary::default();
-
-    if dry_run {
-        summary.deleted_count = local_file_ids.len();
-        summary.details.push(format!("Would delete {} local_file entries", local_file_ids.len()));
-        return Ok(summary);
-    }
-
-    let profile = {
-        let conn = db.conn()?;
-        get_active_profile_or_err(&conn)?
+) -> Result<String, AppError> {
+    let count = local_file_ids.len();
+    let label = if dry_run {
+        format!("Previewing cleanup of {} local entries", count)
+    } else {
+        format!("Cleaning up {} local entries", count)
     };
-
-    let s3 = if delete_s3 { Some(build_s3_client(&profile).await?) } else { None };
-
-    // Collect info about what to delete, then do it
-    for lf_id in &local_file_ids {
-        let (be_id, should_delete_s3, object_uuid) = {
-            let conn = db.conn()?;
-            let be_id: Option<i64> = conn.prepare("SELECT backup_entry_id FROM local_file WHERE id = ?1")?
-                .query_row(rusqlite::params![lf_id], |row: &rusqlite::Row| row.get(0))
-                .optional()?;
-
-            db::delete_local_file(&conn, *lf_id)?;
-            summary.deleted_count += 1;
-
-            if let (Some(be_id), true) = (be_id, delete_s3) {
-                let remaining: i64 = conn.prepare("SELECT count(*) FROM local_file WHERE backup_entry_id = ?1")?
-                    .query_row(rusqlite::params![be_id], |row: &rusqlite::Row| row.get(0))?;
-                if remaining == 0 {
-                    let entry = db::get_backup_entry_by_id(&conn, be_id)?;
-                    let uuid = entry.map(|e| e.object_uuid.clone());
-                    db::delete_backup_entry(&conn, be_id)?;
-                    (Some(be_id), true, uuid)
-                } else {
-                    (Some(be_id), false, None)
-                }
-            } else {
-                (be_id, false, None)
-            }
-        };
-        let _ = be_id;
-
-        if should_delete_s3 {
-            if let (Some(ref s3), Some(ref uuid)) = (&s3, &object_uuid) {
-                s3.delete_object(uuid).await.ok();
-                summary.details.push(format!("Deleted S3 object {}", uuid));
-            }
-        }
-    }
-
-    Ok(summary)
+    let id = queue.enqueue(
+        label,
+        "cleanup",
+        OpParams::CleanupOrphanedLocal { local_file_ids, delete_s3, dry_run },
+    );
+    Ok(id)
 }
 
 #[tauri::command]
@@ -1126,130 +672,46 @@ pub async fn scan_orphaned_s3_objects(db: State<'_, DbState>) -> Result<Vec<Orph
         .collect())
 }
 
+/// Enqueue an S3 orphan cleanup. Returns the op ID immediately.
 #[tauri::command]
-pub async fn cleanup_orphaned_s3_objects(
-    db: State<'_, DbState>,
+pub fn cleanup_orphaned_s3_objects(
+    queue: State<'_, OperationQueue>,
     object_keys: Vec<String>,
     dry_run: bool,
-) -> Result<CleanupSummary, AppError> {
-    let mut summary = CleanupSummary::default();
-    if dry_run {
-        summary.deleted_count = object_keys.len();
-        summary.details.push(format!("Would delete {} S3 objects", object_keys.len()));
-        return Ok(summary);
-    }
-
-    let profile = {
-        let conn = db.conn()?;
-        get_active_profile_or_err(&conn)?
+) -> Result<String, AppError> {
+    let count = object_keys.len();
+    let label = if dry_run {
+        format!("Previewing cleanup of {} S3 objects", count)
+    } else {
+        format!("Cleaning up {} S3 objects", count)
     };
-    let s3 = build_s3_client(&profile).await?;
-    for key in &object_keys {
-        match s3.delete_object(key).await {
-            Ok(()) => { summary.deleted_count += 1; summary.details.push(format!("Deleted {}", key)); }
-            Err(e) => { summary.details.push(format!("Failed {}: {}", key, e)); }
-        }
-    }
-    Ok(summary)
+    let id = queue.enqueue(
+        label,
+        "cleanup",
+        OpParams::CleanupOrphanedS3 { object_keys, dry_run },
+    );
+    Ok(id)
 }
 
 // ══════════════════════════════════════════════════════
 // Phase 10: Integrity Verification
 // ══════════════════════════════════════════════════════
 
-#[derive(Debug, serde::Serialize)]
-pub struct VerifyResult {
-    pub backup_entry_id: i64,
-    pub filename: String,
-    pub status: String,
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Default, serde::Serialize)]
-pub struct VerifySummary {
-    pub passed: usize,
-    pub failed: usize,
-    pub errors: usize,
-    pub results: Vec<VerifyResult>,
-}
-
+/// Enqueue an integrity verification. Returns the op ID immediately.
+/// Results are delivered via the `verify:complete` event.
 #[tauri::command]
-pub async fn verify_integrity(
-    app: tauri::AppHandle,
-    db: State<'_, DbState>,
+pub fn verify_integrity(
+    queue: State<'_, OperationQueue>,
     backup_entry_ids: Vec<i64>,
-) -> Result<VerifySummary, AppError> {
-    let (profile, entries) = {
-        let conn = db.conn()?;
-        let profile = get_active_profile_or_err(&conn)?;
-        let mut entries = Vec::new();
-        for id in &backup_entry_ids {
-            if let Some(e) = db::get_backup_entry_by_id(&conn, *id)? {
-                let local_files = db::list_local_files(&conn, e.id)?;
-                let filename = local_files.first()
-                    .map(|lf| Path::new(&lf.local_path).file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| lf.local_path.clone()))
-                    .unwrap_or_else(|| e.object_uuid.clone());
-                entries.push((e, filename));
-            }
-        }
-        (profile, entries)
+) -> Result<String, AppError> {
+    let count = backup_entry_ids.len();
+    let label = if count == 1 {
+        "Verifying 1 file".into()
+    } else {
+        format!("Verifying {} files", count)
     };
-
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
-    let s3 = build_s3_client(&profile).await?;
-    let mut summary = VerifySummary::default();
-
-    for (entry, filename) in &entries {
-        let _ = app.emit("verify:progress", VerifyProgressEvent {
-            processed: summary.passed + summary.failed + summary.errors,
-            total: entries.len(),
-            current_file: filename.clone(),
-            passed: summary.passed,
-            failed: summary.failed,
-            errors: summary.errors,
-        });
-
-        let temp_encrypted = crypto::generate_temp_path(&temp_dir);
-
-        match s3.download_object(&entry.object_uuid, &temp_encrypted).await {
-            Ok(()) => {
-                match crypto::compute_file_md5(&temp_encrypted) {
-                    Ok(md5) if md5 == entry.encrypted_md5 => {
-                        let temp_decrypted = crypto::generate_temp_path(&temp_dir);
-                        match crypto::decrypt_file(&temp_encrypted, &temp_decrypted, &encryption_key) {
-                            Ok(()) => {
-                                summary.passed += 1;
-                                summary.results.push(VerifyResult { backup_entry_id: entry.id, filename: filename.clone(), status: "passed".into(), detail: None });
-                            }
-                            Err(e) => {
-                                summary.errors += 1;
-                                summary.results.push(VerifyResult { backup_entry_id: entry.id, filename: filename.clone(), status: "error".into(), detail: Some(format!("GCM auth failed: {}", e)) });
-                            }
-                        }
-                        let _ = std::fs::remove_file(&temp_decrypted);
-                    }
-                    Ok(md5) => {
-                        summary.failed += 1;
-                        summary.results.push(VerifyResult { backup_entry_id: entry.id, filename: filename.clone(), status: "failed".into(), detail: Some(format!("MD5 mismatch: expected {}, got {}", entry.encrypted_md5, md5)) });
-                    }
-                    Err(e) => {
-                        summary.errors += 1;
-                        summary.results.push(VerifyResult { backup_entry_id: entry.id, filename: filename.clone(), status: "error".into(), detail: Some(format!("MD5 error: {}", e)) });
-                    }
-                }
-            }
-            Err(e) => {
-                summary.errors += 1;
-                summary.results.push(VerifyResult { backup_entry_id: entry.id, filename: filename.clone(), status: "error".into(), detail: Some(format!("Download failed: {}", e)) });
-            }
-        }
-        let _ = std::fs::remove_file(&temp_encrypted);
-    }
-
-    Ok(summary)
+    let id = queue.enqueue(label, "verify", OpParams::VerifyIntegrity { backup_entry_ids });
+    Ok(id)
 }
 
 // ══════════════════════════════════════════════════════

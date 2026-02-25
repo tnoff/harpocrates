@@ -307,9 +307,12 @@ fn file_has_changed(
     }
 }
 
-/// Backup a directory with change detection, dedup, and batching
+/// Backup a directory with change detection, dedup, and batching.
+///
+/// `on_progress` is called at the start of each file with the current summary
+/// snapshot and the file path string, allowing callers to emit progress events.
 pub async fn backup_directory(
-    conn: &Connection,
+    db: &crate::db::DbState,
     s3: &S3Client,
     profile_id: i64,
     dir_path: &Path,
@@ -319,6 +322,7 @@ pub async fn backup_directory(
     skip_patterns: &[Regex],
     force_checksum: bool,
     cancel_flag: Arc<AtomicBool>,
+    on_progress: impl Fn(&BackupSummary, &str) + Send,
 ) -> Result<BackupSummary, AppError> {
     let files = scan_directory(dir_path, skip_patterns)?;
     let total_files = files.len();
@@ -333,14 +337,17 @@ pub async fn backup_directory(
     for file_path in &files {
         // Check cancellation
         if cancel_flag.load(Ordering::Relaxed) {
-            // Flush pending writes before stopping
-            flush_pending_writes(conn, &pending_writes)?;
+            let conn = db.conn()?;
+            flush_pending_writes(&conn, &pending_writes)?;
             pending_writes.clear();
             break;
         }
 
         let full_path_str = file_path.to_string_lossy().to_string();
         let stored_path = strip_relative_path(&full_path_str, relative_path);
+
+        // Emit progress before processing this file
+        on_progress(&summary, &full_path_str);
 
         // Get file metadata
         let metadata = match std::fs::metadata(file_path) {
@@ -365,14 +372,17 @@ pub async fn backup_directory(
 
         // Change detection (fast path)
         if !force_checksum {
-            match file_has_changed(conn, profile_id, &stored_path, current_mtime, current_size) {
+            let change_result = {
+                let conn = db.conn()?;
+                file_has_changed(&conn, profile_id, &stored_path, current_mtime, current_size)
+            };
+            match change_result {
                 Ok((false, Some(_entry_id))) => {
-                    // File unchanged, skip
                     summary.skipped += 1;
                     summary.processed += 1;
                     continue;
                 }
-                Ok(_) => {} // Changed or new, continue processing
+                Ok(_) => {}
                 Err(e) => {
                     summary.failed += 1;
                     summary.failures.push(BackupFailure {
@@ -399,10 +409,14 @@ pub async fn backup_directory(
             }
         };
 
-        // Check dedup
-        match find_backup_by_md5(conn, profile_id, &original_md5) {
+        // Check dedup (short DB lock)
+        let dedup_result = {
+            let conn = db.conn()?;
+            find_backup_by_md5(&conn, profile_id, &original_md5)
+        };
+
+        match dedup_result {
             Ok(Some(existing)) => {
-                // Dedup match
                 pending_writes.push(PendingWrite {
                     profile_id,
                     object_uuid: existing.object_uuid,
@@ -419,12 +433,10 @@ pub async fn backup_directory(
                 summary.processed += 1;
             }
             Ok(None) => {
-                // New file: encrypt and upload
                 let temp_path = crypto::generate_temp_path(temp_dir);
                 match crypto::encrypt_file(file_path, &temp_path, encryption_key) {
                     Ok(encrypt_meta) => {
                         let object_uuid = uuid::Uuid::new_v4().to_string();
-                        // Multipart is handled automatically for large files
                         let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
                         let _ = std::fs::remove_file(&temp_path);
 
@@ -476,18 +488,22 @@ pub async fn backup_directory(
             }
         }
 
-        // Batch flush
+        // Batch flush (short DB lock)
         if pending_writes.len() >= BATCH_SIZE
             || last_flush.elapsed().as_secs() >= BATCH_INTERVAL_SECS
         {
-            flush_pending_writes(conn, &pending_writes)?;
+            let conn = db.conn()?;
+            flush_pending_writes(&conn, &pending_writes)?;
             pending_writes.clear();
             last_flush = Instant::now();
         }
     }
 
     // Final flush
-    flush_pending_writes(conn, &pending_writes)?;
+    {
+        let conn = db.conn()?;
+        flush_pending_writes(&conn, &pending_writes)?;
+    }
 
     Ok(summary)
 }
