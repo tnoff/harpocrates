@@ -86,8 +86,8 @@ pub fn strip_relative_path(full_path: &str, relative_path: Option<&str>) -> Stri
     match relative_path {
         Some(prefix) => {
             let prefix = prefix.trim_end_matches('/');
-            if full_path.starts_with(prefix) {
-                full_path[prefix.len()..].trim_start_matches('/').to_string()
+            if let Some(stripped) = full_path.strip_prefix(prefix) {
+                stripped.trim_start_matches('/').to_string()
             } else {
                 full_path.to_string()
             }
@@ -107,7 +107,7 @@ pub fn expand_relative_path(stored_path: &str, relative_path: Option<&str>) -> P
     }
 }
 
-/// Backup a single file
+#[allow(dead_code)]
 pub async fn backup_single_file(
     conn: &Connection,
     s3: &S3Client,
@@ -311,6 +311,7 @@ fn file_has_changed(
 ///
 /// `on_progress` is called at the start of each file with the current summary
 /// snapshot and the file path string, allowing callers to emit progress events.
+#[allow(clippy::too_many_arguments)]
 pub async fn backup_directory(
     db: &crate::db::DbState,
     s3: &S3Client,

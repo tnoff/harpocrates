@@ -856,7 +856,7 @@ async fn run_cleanup_local(
                     .and_then(|mut s| s.query_row(rusqlite::params![lf_id], |r| r.get::<_, String>(0)))
                     .map(|p| {
                         p.split('/')
-                            .last()
+                            .next_back()
                             .unwrap_or(&p)
                             .to_string()
                     })
@@ -893,7 +893,7 @@ async fn run_cleanup_local(
                     total,
                     current_item: local_path
                         .split('/')
-                        .last()
+                        .next_back()
                         .unwrap_or(&local_path)
                         .to_string(),
                     deleted,
@@ -965,7 +965,7 @@ async fn run_cleanup_s3(
 
     let pending_names: Vec<String> = object_keys
         .iter()
-        .map(|k| k.split('/').last().unwrap_or(k).to_string())
+        .map(|k| k.split('/').next_back().unwrap_or(k).to_string())
         .collect();
     let _ = app.emit(
         "op:pending_files",
@@ -979,7 +979,7 @@ async fn run_cleanup_s3(
                 op_id: op_id.to_string(),
                 processed: idx,
                 total,
-                current_item: key.split('/').last().unwrap_or(key).to_string(),
+                current_item: key.split('/').next_back().unwrap_or(key).to_string(),
                 deleted,
                 failed,
             },
