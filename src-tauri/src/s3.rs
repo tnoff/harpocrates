@@ -269,7 +269,7 @@ impl S3Client {
         key: &str,
         file_path: &Path,
         part_size: usize,
-        upload_bps: u64,
+        _upload_bps: u64,
     ) -> Result<(), AppError> {
         let file_data = std::fs::read(file_path)?;
         let total_size = file_data.len();

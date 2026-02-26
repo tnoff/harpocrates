@@ -149,6 +149,7 @@ pub struct Profile {
     pub created_at: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_profile(
     conn: &Connection,
     name: &str,
@@ -469,6 +470,7 @@ pub fn insert_local_file(
     Ok(conn.last_insert_rowid())
 }
 
+#[cfg(test)]
 pub fn get_local_file_by_path(
     conn: &Connection,
     backup_entry_id: i64,
@@ -513,6 +515,7 @@ pub fn list_local_files(conn: &Connection, backup_entry_id: i64) -> Result<Vec<L
     Ok(files)
 }
 
+#[cfg(test)]
 pub fn update_local_file_cache(
     conn: &Connection,
     id: i64,

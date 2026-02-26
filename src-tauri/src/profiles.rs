@@ -17,6 +17,7 @@ pub fn generate_encryption_key() -> String {
     hex::encode(key_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_profile(
     conn: &Connection,
     name: &str,
@@ -84,7 +85,7 @@ pub fn get_active_profile(conn: &Connection) -> Result<Option<db::Profile>, AppE
 }
 
 pub fn switch_profile(conn: &Connection, profile_id: i64) -> Result<db::Profile, AppError> {
-    let profile = db::get_profile_by_id(conn, profile_id)?
+    db::get_profile_by_id(conn, profile_id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", profile_id)))?;
     db::set_active_profile(conn, profile_id)?;
     // Return refreshed profile
@@ -92,6 +93,7 @@ pub fn switch_profile(conn: &Connection, profile_id: i64) -> Result<db::Profile,
         .ok_or_else(|| AppError::NotFound("profile not found after switch".into()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update_profile(
     conn: &Connection,
     id: i64,
