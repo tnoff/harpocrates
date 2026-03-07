@@ -6,24 +6,63 @@
   import { selectionStore } from "$lib/stores/selection.svelte";
   import { toast } from "$lib/stores/toast.svelte";
 
+  interface FileEntry { id: number; object_uuid: string; filename: string; local_path: string; file_size: number; original_md5: string; created_at: string; }
   interface ManifestFileEntry { uuid: string; filename: string; size: number; }
   interface ManifestFileList { manifest_uuid: string; files: ManifestFileEntry[]; }
   interface ShareManifest { id: number; profile_id: number; manifest_uuid: string; label: string | null; file_count: number; is_valid: boolean; created_at: string; }
 
   let activeTab = $state<"create" | "receive" | "manager">(profileStore.isReadOnly ? "receive" : "create");
 
-  // Create tab
+  // ── Create tab ──────────────────────────────────────────────────────────────
   let createLabel = $state("");
   let creating = $state(false);
   let createdUuid = $state("");
   let copiedCreate = $state(false);
+
+  // File picker state for the create tab
+  let pickerFiles = $state<FileEntry[]>([]);
+  let pickerSearch = $state("");
+  let pickerLoading = $state(false);
+  let shareSelectedIds = $state<Set<number>>(new Set(selectionStore.array));
+
+  let filteredPickerFiles = $derived(
+    pickerSearch.trim()
+      ? pickerFiles.filter(f => f.filename.toLowerCase().includes(pickerSearch.toLowerCase()))
+      : pickerFiles
+  );
+
+  async function loadPickerFiles() {
+    pickerLoading = true;
+    try {
+      pickerFiles = await invoke<FileEntry[]>("list_files", { search: null });
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      pickerLoading = false;
+    }
+  }
+
+  function togglePickerFile(id: number) {
+    const next = new Set(shareSelectedIds);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    shareSelectedIds = next;
+  }
+
+  function toggleAllPicker() {
+    const allFilteredIds = filteredPickerFiles.map(f => f.id);
+    const allSelected = allFilteredIds.every(id => shareSelectedIds.has(id));
+    const next = new Set(shareSelectedIds);
+    if (allSelected) allFilteredIds.forEach(id => next.delete(id));
+    else allFilteredIds.forEach(id => next.add(id));
+    shareSelectedIds = next;
+  }
 
   async function createManifest() {
     creating = true;
     createdUuid = "";
     try {
       createdUuid = await invoke<string>("create_share_manifest", {
-        backupEntryIds: selectionStore.array,
+        backupEntryIds: [...shareSelectedIds],
         label: createLabel || null,
       });
     } catch (e) {
@@ -39,7 +78,7 @@
     setTimeout(() => copiedCreate = false, 2000);
   }
 
-  // Receive tab
+  // ── Receive tab ─────────────────────────────────────────────────────────────
   let receiveUuid = $state("");
   let fetching = $state(false);
   let manifestFiles = $state<ManifestFileList | null>(null);
@@ -83,7 +122,7 @@
     }
   }
 
-  // Manager tab
+  // ── Manager tab ─────────────────────────────────────────────────────────────
   let manifests = $state<ShareManifest[]>([]);
   let loadingManifests = $state(false);
   let copiedManagerUuid = $state<number | null>(null);
@@ -121,6 +160,7 @@
 
   $effect(() => {
     if (activeTab === "manager") loadManifests();
+    if (activeTab === "create") loadPickerFiles();
   });
 
   function formatSize(bytes: number): string {
@@ -144,32 +184,85 @@
 
   <!-- Create Tab -->
   {#if activeTab === "create"}
-    <div class="tab-content narrow">
-      {#if selectionStore.count === 0}
-        <p class="muted-text">Select files from the Files tab first, then come here to create a share manifest.</p>
-      {:else}
-        <p class="muted-text">Creating share for {selectionStore.count} file(s).</p>
-        <div class="field">
-          <label class="field-label" for="share-label">Label (optional)</label>
-          <input id="share-label" bind:value={createLabel} class="text-input" placeholder="Share description" />
+    <div class="tab-content">
+      <div class="create-layout">
+        <!-- File picker -->
+        <div class="picker-section">
+          <div class="picker-header">
+            <span class="picker-title">Select files to share</span>
+            <span class="picker-count">{shareSelectedIds.size} selected</span>
+          </div>
+          <input
+            bind:value={pickerSearch}
+            class="text-input picker-search"
+            placeholder="Search files..."
+          />
+          {#if pickerLoading}
+            <p class="muted-text">Loading files...</p>
+          {:else if pickerFiles.length === 0}
+            <p class="muted-text">No files in bucket.</p>
+          {:else}
+            <div class="table-wrap picker-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="col-check">
+                      <input
+                        type="checkbox"
+                        checked={filteredPickerFiles.length > 0 && filteredPickerFiles.every(f => shareSelectedIds.has(f.id))}
+                        indeterminate={filteredPickerFiles.some(f => shareSelectedIds.has(f.id)) && !filteredPickerFiles.every(f => shareSelectedIds.has(f.id))}
+                        onchange={toggleAllPicker}
+                      />
+                    </th>
+                    <th>Filename</th>
+                    <th>Size</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each filteredPickerFiles as file}
+                    <tr onclick={() => togglePickerFile(file.id)} class="picker-row">
+                      <td><input type="checkbox" checked={shareSelectedIds.has(file.id)} onchange={() => togglePickerFile(file.id)} onclick={(e) => e.stopPropagation()} /></td>
+                      <td class="filename-cell">{file.filename}</td>
+                      <td class="col-nowrap">{formatSize(file.file_size)}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+            {#if filteredPickerFiles.length === 0}
+              <p class="muted-text">No files match your search.</p>
+            {/if}
+          {/if}
         </div>
 
-        {#if createdUuid}
-          <div class="success-box">
-            <p class="success-heading">Share created!</p>
-            <div class="uuid-row">
-              <code class="uuid-code">{createdUuid}</code>
-              <button onclick={() => copyUuid(createdUuid)} class="btn-copy">
-                {copiedCreate ? "Copied!" : "Copy"}
-              </button>
-            </div>
+        <!-- Create form -->
+        <div class="create-form">
+          <div class="field">
+            <label class="field-label" for="share-label">Label <span class="optional">(optional)</span></label>
+            <input id="share-label" bind:value={createLabel} class="text-input" placeholder="Share description" />
           </div>
-        {/if}
 
-        <button onclick={createManifest} disabled={creating || selectionStore.count === 0} class="btn-primary">
-          {creating ? "Creating..." : "Create Share"}
-        </button>
-      {/if}
+          {#if createdUuid}
+            <div class="success-box">
+              <p class="success-heading">Share created!</p>
+              <div class="uuid-row">
+                <code class="uuid-code">{createdUuid}</code>
+                <button onclick={() => copyUuid(createdUuid)} class="btn-copy">
+                  {copiedCreate ? "Copied!" : "Copy"}
+                </button>
+              </div>
+            </div>
+          {/if}
+
+          <button
+            onclick={createManifest}
+            disabled={creating || shareSelectedIds.size === 0}
+            class="btn-primary"
+          >
+            {creating ? "Creating..." : `Create Share (${shareSelectedIds.size} file${shareSelectedIds.size === 1 ? "" : "s"})`}
+          </button>
+        </div>
+      </div>
     </div>
   {/if}
 
@@ -335,9 +428,65 @@
 
   .narrow { max-width: 32rem; }
 
+  /* Create layout */
+  .create-layout {
+    display: grid;
+    grid-template-columns: 1fr 20rem;
+    gap: 1.5rem;
+    align-items: start;
+  }
+
+  .picker-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .picker-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+
+  .picker-title {
+    font-size: 0.875rem;
+    font-weight: 500;
+  }
+
+  .picker-count {
+    font-size: 0.8rem;
+    color: #64748b;
+  }
+
+  .picker-search { width: 100%; }
+
+  .picker-table {
+    max-height: 24rem;
+    overflow-y: auto;
+  }
+
+  .picker-row { cursor: pointer; }
+
+  .filename-cell {
+    max-width: 0;
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .create-form {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    position: sticky;
+    top: 1rem;
+  }
+
   /* Form elements */
   .field { display: flex; flex-direction: column; gap: 0.375rem; }
   .field-label { font-size: 0.875rem; font-weight: 500; }
+  .optional { font-weight: 400; color: #94a3b8; }
 
   .text-input {
     padding: 0.5rem 0.75rem;
@@ -496,6 +645,7 @@
     .tab-btn.active { background: #1e293b; border-color: #334155; border-bottom-color: #1e293b; color: #f1f5f9; }
     .text-input { background: #0f172a; border-color: #475569; color: #f1f5f9; }
     .text-input::placeholder { color: #64748b; }
+    .picker-count { color: #64748b; }
     .muted-text { color: #94a3b8; }
     .success-box { background: rgb(21 128 61 / 0.1); border-color: rgb(21 128 61 / 0.4); }
     .success-heading { color: #4ade80; }
