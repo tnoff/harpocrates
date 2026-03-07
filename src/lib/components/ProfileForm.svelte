@@ -52,6 +52,10 @@
   let importKey = $state("");
   let useImportKey = $state(false);
 
+  let isReadOnly = $derived(mode === "read-only");
+  // Read-only profiles must always import an existing key — generating one makes no sense.
+  let effectiveUseImportKey = $derived(isReadOnly || useImportKey);
+
   let submitting = $state(false);
   let testing = $state(false);
   let testResult = $state<{ ok: boolean; message: string } | null>(null);
@@ -72,7 +76,7 @@
         extra_env: extraEnv || null,
         relative_path: relativePath || null,
         temp_directory: tempDirectory || null,
-        import_encryption_key: useImportKey && importKey ? importKey : null,
+        import_encryption_key: effectiveUseImportKey && importKey ? importKey : null,
       });
     } catch (e) {
       error = String(e);
@@ -195,21 +199,30 @@
   {#if !initial.id}
     <fieldset style="display: flex; flex-direction: column; gap: 1.5rem; border-radius: 0.5rem; padding: 1.25rem;" class="border border-slate-200 dark:border-slate-600">
       <legend class="text-sm font-semibold px-2 text-slate-700 dark:text-slate-300">Encryption Key</legend>
-      <div>
-        <label style="display: flex; align-items: center; gap: 0.625rem; font-size: 0.875rem; cursor: pointer;">
-          <input type="checkbox" bind:checked={useImportKey} class="w-4 h-4 rounded accent-primary" />
-          Import existing encryption key
-        </label>
-        <p class="form-hint">Check this if you're reconnecting to an existing vault and already have its encryption key.</p>
-      </div>
-      {#if useImportKey}
+
+      {#if isReadOnly}
         <div>
           <label class="form-label" for="pf-import-key">Encryption Key</label>
-          <input id="pf-import-key" bind:value={importKey} type="password" class="form-input" placeholder="Paste your 64-character hex key" />
-          <p class="form-hint">Must be the exact 64-character hex key used when the vault was originally created.</p>
+          <input id="pf-import-key" bind:value={importKey} type="password" required class="form-input" placeholder="Paste your 64-character hex key" />
+          <p class="form-hint">Read-only profiles can only decrypt — provide the key from the original vault.</p>
         </div>
       {:else}
-        <p class="form-warning">⚠ A new encryption key will be generated. You must save it — it cannot be recovered if lost.</p>
+        <div>
+          <label style="display: flex; align-items: center; gap: 0.625rem; font-size: 0.875rem; cursor: pointer;">
+            <input type="checkbox" bind:checked={useImportKey} class="w-4 h-4 rounded accent-primary" />
+            Import existing encryption key
+          </label>
+          <p class="form-hint">Check this if you're reconnecting to an existing vault and already have its encryption key.</p>
+        </div>
+        {#if useImportKey}
+          <div>
+            <label class="form-label" for="pf-import-key">Encryption Key</label>
+            <input id="pf-import-key" bind:value={importKey} type="password" class="form-input" placeholder="Paste your 64-character hex key" />
+            <p class="form-hint">Must be the exact 64-character hex key used when the vault was originally created.</p>
+          </div>
+        {:else}
+          <p class="form-warning">⚠ A new encryption key will be generated. You must save it — it cannot be recovered if lost.</p>
+        {/if}
       {/if}
     </fieldset>
   {/if}
