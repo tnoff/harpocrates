@@ -14,6 +14,16 @@ use crate::s3::S3Client;
 const BATCH_SIZE: usize = 50;
 const BATCH_INTERVAL_SECS: u64 = 30;
 
+/// Construct an S3 object key from an optional prefix and a UUID.
+/// If prefix is Some and non-empty, returns `"{prefix}/{uuid}"`.
+/// Otherwise returns just `uuid`.
+pub fn make_s3_key(prefix: Option<&str>, uuid: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{}/{}", p, uuid),
+        _ => uuid.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BackupResult {
     pub backup_entry_id: i64,
@@ -107,13 +117,14 @@ pub fn expand_relative_path(stored_path: &str, relative_path: Option<&str>) -> P
     }
 }
 
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub async fn backup_single_file(
     conn: &Connection,
     s3: &S3Client,
     profile_id: i64,
     file_path: &Path,
     encryption_key: &str,
+    s3_key_prefix: Option<&str>,
     relative_path: Option<&str>,
     temp_dir: &Path,
 ) -> Result<BackupResult, AppError> {
@@ -153,7 +164,7 @@ pub async fn backup_single_file(
     let encrypt_result = crypto::encrypt_file(file_path, &temp_path, encryption_key)?;
 
     // Generate UUID for S3 object
-    let object_uuid = uuid::Uuid::new_v4().to_string();
+    let object_uuid = make_s3_key(s3_key_prefix, &uuid::Uuid::new_v4().to_string());
 
     // Upload to S3 (multipart is handled automatically for large files)
     let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
@@ -318,6 +329,7 @@ pub async fn backup_directory(
     profile_id: i64,
     dir_path: &Path,
     encryption_key: &str,
+    s3_key_prefix: Option<&str>,
     relative_path: Option<&str>,
     temp_dir: &Path,
     skip_patterns: &[Regex],
@@ -437,7 +449,7 @@ pub async fn backup_directory(
                 let temp_path = crypto::generate_temp_path(temp_dir);
                 match crypto::encrypt_file(file_path, &temp_path, encryption_key) {
                     Ok(encrypt_meta) => {
-                        let object_uuid = uuid::Uuid::new_v4().to_string();
+                        let object_uuid = make_s3_key(s3_key_prefix, &uuid::Uuid::new_v4().to_string());
                         let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
                         let _ = std::fs::remove_file(&temp_path);
 
@@ -631,6 +643,7 @@ mod tests {
                 extra_env TEXT,
                 relative_path TEXT,
                 temp_directory TEXT,
+                s3_key_prefix TEXT,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(s3_endpoint, s3_bucket)
@@ -671,7 +684,7 @@ mod tests {
     fn test_flush_pending_writes_new_entry() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
         ).unwrap();
 
         let writes = vec![PendingWrite {
@@ -702,7 +715,7 @@ mod tests {
     fn test_flush_pending_writes_dedup() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
         ).unwrap();
         let eid = db::insert_backup_entry(&conn, pid, "existing-uuid", "md5a", "md5b", 256).unwrap();
 
@@ -751,7 +764,7 @@ mod tests {
     fn test_find_backup_by_md5_found() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None,
+            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None,
         ).unwrap();
         db::insert_backup_entry(&conn, pid, "uuid-1", "target-md5", "enc-md5", 100).unwrap();
 
@@ -764,7 +777,7 @@ mod tests {
     fn test_find_backup_by_md5_not_found() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None,
+            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None,
         ).unwrap();
 
         let result = find_backup_by_md5(&conn, pid, "nonexistent-md5").unwrap();
@@ -775,10 +788,10 @@ mod tests {
     fn test_find_backup_by_md5_profile_scoped() {
         let conn = setup_db();
         let pid1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None,
+            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None,
         ).unwrap();
         let pid2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None,
+            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None,
         ).unwrap();
 
         db::insert_backup_entry(&conn, pid1, "uuid-1", "shared-md5", "enc-md5", 100).unwrap();
@@ -786,5 +799,27 @@ mod tests {
         // Same MD5 but different profile should not match
         let result = find_backup_by_md5(&conn, pid2, "shared-md5").unwrap();
         assert!(result.is_none());
+    }
+
+    // ── make_s3_key tests ──
+
+    #[test]
+    fn test_make_s3_key_no_prefix() {
+        assert_eq!(make_s3_key(None, "my-uuid"), "my-uuid");
+    }
+
+    #[test]
+    fn test_make_s3_key_empty_prefix() {
+        assert_eq!(make_s3_key(Some(""), "my-uuid"), "my-uuid");
+    }
+
+    #[test]
+    fn test_make_s3_key_with_prefix() {
+        assert_eq!(make_s3_key(Some("team-alpha"), "my-uuid"), "team-alpha/my-uuid");
+    }
+
+    #[test]
+    fn test_make_s3_key_nested_prefix() {
+        assert_eq!(make_s3_key(Some("org/team"), "my-uuid"), "org/team/my-uuid");
     }
 }

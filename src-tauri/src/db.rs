@@ -13,7 +13,7 @@ impl DbState {
     }
 }
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub fn init_database(path: &str) -> Result<Connection, AppError> {
     let conn = Connection::open(path)?;
@@ -27,6 +27,9 @@ pub fn init_database(path: &str) -> Result<Connection, AppError> {
     }
     if version < 2 {
         migrate_v1_to_v2(&conn)?;
+    }
+    if version < 3 {
+        migrate_v2_to_v3(&conn)?;
     }
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -48,6 +51,7 @@ fn create_schema(conn: &Connection) -> Result<(), AppError> {
             extra_env TEXT,
             relative_path TEXT,
             temp_directory TEXT,
+            s3_key_prefix TEXT,
             is_active BOOLEAN NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -132,6 +136,11 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), AppError> {
     Ok(())
 }
 
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), AppError> {
+    conn.execute_batch("ALTER TABLE profile ADD COLUMN s3_key_prefix TEXT;")?;
+    Ok(())
+}
+
 // ── Profile CRUD ──
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -145,6 +154,7 @@ pub struct Profile {
     pub extra_env: Option<String>,
     pub relative_path: Option<String>,
     pub temp_directory: Option<String>,
+    pub s3_key_prefix: Option<String>,
     pub is_active: bool,
     pub created_at: String,
 }
@@ -160,18 +170,19 @@ pub fn insert_profile(
     extra_env: Option<&str>,
     relative_path: Option<&str>,
     temp_directory: Option<&str>,
+    s3_key_prefix: Option<&str>,
 ) -> Result<i64, AppError> {
     conn.execute(
-        "INSERT INTO profile (name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory],
+        "INSERT INTO profile (name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at
+        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix
          FROM profile WHERE id = ?1",
     )?;
     let profile = stmt
@@ -188,6 +199,7 @@ pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, 
                 temp_directory: row.get(8)?,
                 is_active: row.get(9)?,
                 created_at: row.get(10)?,
+                s3_key_prefix: row.get(11)?,
             })
         })
         .optional()?;
@@ -196,7 +208,7 @@ pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, 
 
 pub fn list_profiles(conn: &Connection) -> Result<Vec<Profile>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at
+        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix
          FROM profile ORDER BY id",
     )?;
     let profiles = stmt
@@ -213,6 +225,7 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<Profile>, AppError> {
                 temp_directory: row.get(8)?,
                 is_active: row.get(9)?,
                 created_at: row.get(10)?,
+                s3_key_prefix: row.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -550,7 +563,7 @@ mod tests {
     #[test]
     fn test_insert_and_get_profile() {
         let conn = setup_db();
-        let id = insert_profile(&conn, "test", "read-write", "https://s3.example.com", Some("us-east-1"), "my-bucket", None, None, None).unwrap();
+        let id = insert_profile(&conn, "test", "read-write", "https://s3.example.com", Some("us-east-1"), "my-bucket", None, None, None, None).unwrap();
         let profile = get_profile_by_id(&conn, id).unwrap().unwrap();
         assert_eq!(profile.name, "test");
         assert_eq!(profile.mode, "read-write");
@@ -563,8 +576,8 @@ mod tests {
     #[test]
     fn test_list_profiles() {
         let conn = setup_db();
-        insert_profile(&conn, "p1", "read-write", "https://s3.a.com", None, "b1", None, None, None).unwrap();
-        insert_profile(&conn, "p2", "read-only", "https://s3.b.com", None, "b2", None, None, None).unwrap();
+        insert_profile(&conn, "p1", "read-write", "https://s3.a.com", None, "b1", None, None, None, None).unwrap();
+        insert_profile(&conn, "p2", "read-only", "https://s3.b.com", None, "b2", None, None, None, None).unwrap();
         let profiles = list_profiles(&conn).unwrap();
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].name, "p1");
@@ -574,8 +587,8 @@ mod tests {
     #[test]
     fn test_set_active_profile() {
         let conn = setup_db();
-        let id1 = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None).unwrap();
-        let id2 = insert_profile(&conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None).unwrap();
+        let id1 = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None).unwrap();
+        let id2 = insert_profile(&conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None).unwrap();
         set_active_profile(&conn, id1).unwrap();
         assert!(get_profile_by_id(&conn, id1).unwrap().unwrap().is_active);
         assert!(!get_profile_by_id(&conn, id2).unwrap().unwrap().is_active);
@@ -588,7 +601,7 @@ mod tests {
     #[test]
     fn test_delete_profile() {
         let conn = setup_db();
-        let id = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None).unwrap();
+        let id = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None).unwrap();
         delete_profile(&conn, id).unwrap();
         assert!(get_profile_by_id(&conn, id).unwrap().is_none());
     }
@@ -596,8 +609,8 @@ mod tests {
     #[test]
     fn test_unique_profile_name() {
         let conn = setup_db();
-        insert_profile(&conn, "same-name", "read-write", "https://a.com", None, "b1", None, None, None).unwrap();
-        let result = insert_profile(&conn, "same-name", "read-write", "https://b.com", None, "b2", None, None, None);
+        insert_profile(&conn, "same-name", "read-write", "https://a.com", None, "b1", None, None, None, None).unwrap();
+        let result = insert_profile(&conn, "same-name", "read-write", "https://b.com", None, "b2", None, None, None, None);
         assert!(result.is_err());
     }
 
@@ -606,7 +619,7 @@ mod tests {
     #[test]
     fn test_backup_entry_crud() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
 
         let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5orig", "md5enc", 1024).unwrap();
         let entry = get_backup_entry_by_id(&conn, eid).unwrap().unwrap();
@@ -627,7 +640,7 @@ mod tests {
     #[test]
     fn test_backup_entry_unique_uuid_per_profile() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
         let result = insert_backup_entry(&conn, pid, "uuid-1", "md5c", "md5d", 200);
         assert!(result.is_err());
@@ -638,7 +651,7 @@ mod tests {
     #[test]
     fn test_share_manifest_crud() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
 
         let mid = insert_share_manifest(&conn, pid, "manifest-uuid", Some("my share"), 3).unwrap();
         let manifest = get_share_manifest_by_id(&conn, mid).unwrap().unwrap();
@@ -663,7 +676,7 @@ mod tests {
     #[test]
     fn test_share_manifest_entries() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         let eid1 = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
         let eid2 = insert_backup_entry(&conn, pid, "uuid-2", "md5c", "md5d", 200).unwrap();
         let mid = insert_share_manifest(&conn, pid, "manifest-1", None, 2).unwrap();
@@ -682,7 +695,7 @@ mod tests {
     #[test]
     fn test_local_file_crud() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
 
         let lfid = insert_local_file(&conn, eid, "/home/user/file.txt", Some(1234.5), Some(100)).unwrap();
@@ -706,7 +719,7 @@ mod tests {
     #[test]
     fn test_local_file_unique_constraint() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
         insert_local_file(&conn, eid, "/path/file.txt", None, None).unwrap();
         let result = insert_local_file(&conn, eid, "/path/file.txt", None, None);
@@ -721,7 +734,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let conn = init_database(db_path.to_str().unwrap()).unwrap();
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -732,7 +745,7 @@ mod tests {
         // First init
         {
             let conn = init_database(db_path.to_str().unwrap()).unwrap();
-            insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+            insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         }
 
         // Second init should not lose data
@@ -759,7 +772,7 @@ mod tests {
     #[test]
     fn test_delete_share_manifest_cascades_entries() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None).unwrap();
         let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
         let mid = insert_share_manifest(&conn, pid, "manifest-1", None, 1).unwrap();
         insert_share_manifest_entry(&conn, mid, eid, "file.txt").unwrap();

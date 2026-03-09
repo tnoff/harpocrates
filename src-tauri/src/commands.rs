@@ -81,6 +81,7 @@ pub struct CreateProfileInput {
     pub relative_path: Option<String>,
     pub temp_directory: Option<String>,
     pub import_encryption_key: Option<String>,
+    pub s3_key_prefix: Option<String>,
 }
 
 #[tauri::command]
@@ -102,6 +103,7 @@ pub fn create_profile(
         input.relative_path.as_deref(),
         input.temp_directory.as_deref(),
         input.import_encryption_key.as_deref(),
+        input.s3_key_prefix.as_deref(),
     )
 }
 
@@ -158,6 +160,7 @@ pub struct UpdateProfileInput {
     pub extra_env: Option<Option<String>>,
     pub relative_path: Option<Option<String>>,
     pub temp_directory: Option<Option<String>>,
+    pub s3_key_prefix: Option<Option<String>>,
 }
 
 #[tauri::command]
@@ -179,6 +182,7 @@ pub fn update_profile(
         input.extra_env.as_ref().map(|o| o.as_deref()),
         input.relative_path.as_ref().map(|o| o.as_deref()),
         input.temp_directory.as_ref().map(|o| o.as_deref()),
+        input.s3_key_prefix.as_ref().map(|o| o.as_deref()),
     )
 }
 
@@ -306,7 +310,7 @@ pub async fn backup_file(db: State<'_, DbState>, file_path: String) -> Result<ba
     let temp_path = crypto::generate_temp_path(&temp_dir);
     let encrypt_result = crypto::encrypt_file(Path::new(&file_path), &temp_path, &encryption_key)?;
 
-    let object_uuid = uuid::Uuid::new_v4().to_string();
+    let object_uuid = backup::make_s3_key(profile.s3_key_prefix.as_deref(), &uuid::Uuid::new_v4().to_string());
 
     // Upload to S3 (async)
     let s3 = build_s3_client(&profile).await?;
@@ -445,7 +449,7 @@ pub async fn create_share_manifest(
     crypto::encrypt_file(&temp_plain, &temp_encrypted, &encryption_key)?;
     let _ = std::fs::remove_file(&temp_plain);
 
-    let manifest_uuid = uuid::Uuid::new_v4().to_string();
+    let manifest_uuid = backup::make_s3_key(profile.s3_key_prefix.as_deref(), &uuid::Uuid::new_v4().to_string());
     let upload_result = s3.upload_object(&manifest_uuid, &temp_encrypted).await;
     let _ = std::fs::remove_file(&temp_encrypted);
     upload_result?;
@@ -665,7 +669,7 @@ pub async fn scan_orphaned_s3_objects(db: State<'_, DbState>) -> Result<Vec<Orph
     };
 
     let s3 = build_s3_client(&profile).await?;
-    let objects = s3.list_objects().await?;
+    let objects = s3.list_objects(profile.s3_key_prefix.as_deref()).await?;
     Ok(objects.into_iter()
         .filter(|obj| !known_uuids.contains(&obj.key))
         .map(|obj| OrphanedS3Object { key: obj.key, size: obj.size })
@@ -772,8 +776,8 @@ pub fn import_database(db: State<DbState>, file_path: String) -> Result<(), AppE
 
     for p in &import.profiles {
         conn.execute(
-            "INSERT INTO profile (id,name,mode,s3_endpoint,s3_region,s3_bucket,extra_env,relative_path,temp_directory,is_active,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            rusqlite::params![p.id,p.name,p.mode,p.s3_endpoint,p.s3_region,p.s3_bucket,p.extra_env,p.relative_path,p.temp_directory,p.is_active,p.created_at],
+            "INSERT INTO profile (id,name,mode,s3_endpoint,s3_region,s3_bucket,extra_env,relative_path,temp_directory,is_active,created_at,s3_key_prefix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![p.id,p.name,p.mode,p.s3_endpoint,p.s3_region,p.s3_bucket,p.extra_env,p.relative_path,p.temp_directory,p.is_active,p.created_at,p.s3_key_prefix],
         )?;
     }
     for e in &import.backup_entries {

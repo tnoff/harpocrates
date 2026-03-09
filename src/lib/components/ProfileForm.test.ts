@@ -78,6 +78,61 @@ describe('ProfileForm — encryption key section (editing existing profile)', ()
   });
 });
 
+describe('ProfileForm — s3 key prefix field', () => {
+  it('renders the key prefix input', () => {
+    render(ProfileForm, { onsubmit: noop });
+    expect(screen.getByLabelText(/key prefix/i)).toBeInTheDocument();
+  });
+
+  it('pre-populates from initial value', () => {
+    render(ProfileForm, { onsubmit: noop, initial: { s3_key_prefix: 'team-alpha' } });
+    expect(screen.getByLabelText(/key prefix/i)).toHaveValue('team-alpha');
+  });
+
+  it('submits null when the field is left empty', async () => {
+    const mockSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(ProfileForm, { onsubmit: mockSubmit });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(mockSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ s3_key_prefix: null })
+    );
+  });
+
+  it('submits the trimmed value when filled in', async () => {
+    const mockSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(ProfileForm, { onsubmit: mockSubmit });
+    await fireEvent.input(screen.getByLabelText(/key prefix/i), {
+      target: { value: '  team-alpha  ' },
+    });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(mockSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ s3_key_prefix: 'team-alpha' })
+    );
+  });
+
+  it('rejects a prefix over 200 characters', async () => {
+    const mockSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(ProfileForm, { onsubmit: mockSubmit });
+    await fireEvent.input(screen.getByLabelText(/key prefix/i), {
+      target: { value: 'a'.repeat(201) },
+    });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(mockSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/200 characters/i)).toBeInTheDocument();
+  });
+
+  it('rejects a prefix containing consecutive slashes', async () => {
+    const mockSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(ProfileForm, { onsubmit: mockSubmit });
+    await fireEvent.input(screen.getByLabelText(/key prefix/i), {
+      target: { value: 'foo//bar' },
+    });
+    await fireEvent.submit(container.querySelector('form')!);
+    expect(mockSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText(/consecutive slashes/i)).toBeInTheDocument();
+  });
+});
+
 describe('ProfileForm — submission', () => {
   async function submitForm(container: HTMLElement) {
     await fireEvent.submit(container.querySelector('form')!);

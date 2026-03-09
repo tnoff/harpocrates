@@ -27,7 +27,10 @@
 
   let filteredPickerFiles = $derived(
     pickerSearch.trim()
-      ? pickerFiles.filter(f => f.filename.toLowerCase().includes(pickerSearch.toLowerCase()))
+      ? pickerFiles.filter(f => {
+          const q = pickerSearch.toLowerCase();
+          return f.filename.toLowerCase().includes(q) || f.local_path.toLowerCase().includes(q);
+        })
       : pickerFiles
   );
 

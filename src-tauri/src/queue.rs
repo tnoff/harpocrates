@@ -464,6 +464,7 @@ async fn run_backup_directory(
         profile.id,
         Path::new(dir_path),
         &encryption_key,
+        profile.s3_key_prefix.as_deref(),
         profile.relative_path.as_deref(),
         &temp_dir,
         &regexes,
@@ -758,7 +759,10 @@ async fn run_scramble(
 
     let pending_names: Vec<String> = entries
         .iter()
-        .map(|e| format!("{}…", &e.object_uuid[..8]))
+        .map(|e| {
+            let display_key = e.object_uuid.rsplit('/').next().unwrap_or(&e.object_uuid);
+            format!("{}…", &display_key[..8.min(display_key.len())])
+        })
         .collect();
     let _ = app.emit(
         "op:pending_files",
@@ -766,30 +770,34 @@ async fn run_scramble(
     );
 
     for entry in &entries {
+        let display_key = entry.object_uuid.rsplit('/').next().unwrap_or(&entry.object_uuid);
         let _ = app.emit(
             "scramble:progress",
             ScrambleProgressEvent {
                 op_id: op_id.to_string(),
                 processed: scrambled + failed,
                 total,
-                current_file: format!("{}...", &entry.object_uuid[..8]),
+                current_file: format!("{}…", &display_key[..8.min(display_key.len())]),
                 scrambled,
                 failed,
             },
         );
 
-        let new_uuid = uuid::Uuid::new_v4().to_string();
-        match s3.copy_object(&entry.object_uuid, &new_uuid).await {
+        let new_key = crate::backup::make_s3_key(
+            profile.s3_key_prefix.as_deref(),
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        match s3.copy_object(&entry.object_uuid, &new_key).await {
             Ok(()) => match s3.delete_object(&entry.object_uuid).await {
                 Ok(()) => {
                     let db = app.state::<DbState>();
                     let conn = db.conn()?;
-                    db::update_backup_entry_uuid(&conn, entry.id, &new_uuid)?;
+                    db::update_backup_entry_uuid(&conn, entry.id, &new_key)?;
                     scrambled += 1;
                     scrambled_entry_ids.push(entry.id);
                 }
                 Err(_) => {
-                    s3.delete_object(&new_uuid).await.ok();
+                    s3.delete_object(&new_key).await.ok();
                     failed += 1;
                 }
             },

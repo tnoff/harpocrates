@@ -16,6 +16,7 @@
       extra_env?: string | null;
       relative_path?: string | null;
       temp_directory?: string | null;
+      s3_key_prefix?: string | null;
     };
     onsubmit: (data: Record<string, unknown>) => Promise<void>;
     submitLabel?: string;
@@ -37,6 +38,7 @@
     extraEnv: initial.extra_env ?? "",
     relativePath: initial.relative_path ?? "",
     tempDirectory: initial.temp_directory ?? "",
+    s3KeyPrefix: initial.s3_key_prefix ?? "",
   }));
 
   let name = $state(iv.name);
@@ -49,6 +51,7 @@
   let extraEnv = $state(iv.extraEnv);
   let relativePath = $state(iv.relativePath);
   let tempDirectory = $state(iv.tempDirectory);
+  let s3KeyPrefix = $state(iv.s3KeyPrefix);
   let importKey = $state("");
   let useImportKey = $state(false);
 
@@ -63,6 +66,19 @@
 
   async function handleSubmit() {
     error = "";
+
+    if (s3KeyPrefix.trim()) {
+      const cleaned = s3KeyPrefix.trim().replace(/^\/+|\/+$/g, '');
+      if (cleaned.length > 200) {
+        error = 'S3 key prefix must not exceed 200 characters';
+        return;
+      }
+      if (cleaned.includes('//')) {
+        error = 'S3 key prefix must not contain consecutive slashes';
+        return;
+      }
+    }
+
     submitting = true;
     try {
       await onsubmit({
@@ -77,6 +93,7 @@
         relative_path: relativePath || null,
         temp_directory: tempDirectory || null,
         import_encryption_key: effectiveUseImportKey && importKey ? importKey : null,
+        s3_key_prefix: s3KeyPrefix.trim() || null,
       });
     } catch (e) {
       error = String(e);
@@ -163,6 +180,18 @@
       </label>
       <input id="pf-extra-env" bind:value={extraEnv} class="form-input" placeholder="KEY=val,KEY2=val2" />
       <p class="form-hint">Comma-separated <code class="font-mono">KEY=value</code> pairs passed to the S3 client. Useful for proxy settings or custom TLS configuration.</p>
+    </div>
+
+    <div>
+      <label class="form-label" for="s3-key-prefix">Key Prefix <span class="font-normal text-slate-400 dark:text-slate-500">(optional)</span></label>
+      <input
+        id="s3-key-prefix"
+        type="text"
+        bind:value={s3KeyPrefix}
+        class="form-input"
+        placeholder="e.g. team-alpha"
+      />
+      <p class="form-hint">Objects will be stored at <code class="font-mono">{s3KeyPrefix ? s3KeyPrefix.replace(/^\/+|\/+$/g, '') + '/' : ''}&lt;uuid&gt;</code>. Useful for per-prefix IAM policies.</p>
     </div>
   </fieldset>
 
