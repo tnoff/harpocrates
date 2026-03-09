@@ -809,6 +809,91 @@ pub fn import_database(db: State<DbState>, file_path: String) -> Result<(), AppE
 }
 
 // ══════════════════════════════════════════════════════
+// Phase 12: Profile Config Export / Import
+// ══════════════════════════════════════════════════════
+
+/// Serializable snapshot of a profile's connection config, excluding the encryption key.
+/// Written to disk during export; read back during import.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ProfileConfigExport {
+    pub name: String,
+    pub mode: String,
+    pub s3_endpoint: String,
+    pub s3_region: Option<String>,
+    pub s3_bucket: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    pub extra_env: Option<String>,
+    pub relative_path: Option<String>,
+    pub temp_directory: Option<String>,
+    pub s3_key_prefix: Option<String>,
+}
+
+/// Export a profile's connection config (including S3 credentials) to a JSON file.
+/// The encryption key is intentionally omitted; the recipient must supply it at import time.
+#[tauri::command]
+pub fn export_profile_config(
+    db: State<DbState>,
+    profile_id: i64,
+    file_path: String,
+) -> Result<(), AppError> {
+    let conn = db.conn()?;
+    let profile = db::get_profile_by_id(&conn, profile_id)?
+        .ok_or_else(|| AppError::NotFound(format!("Profile {} not found", profile_id)))?;
+    let s3_access_key = credentials::get_s3_access_key(&profile.name)?;
+    let s3_secret_key = credentials::get_s3_secret_key(&profile.name)?;
+    let export = ProfileConfigExport {
+        name: profile.name,
+        mode: profile.mode,
+        s3_endpoint: profile.s3_endpoint,
+        s3_region: profile.s3_region,
+        s3_bucket: profile.s3_bucket,
+        s3_access_key,
+        s3_secret_key,
+        extra_env: profile.extra_env,
+        relative_path: profile.relative_path,
+        temp_directory: profile.temp_directory,
+        s3_key_prefix: profile.s3_key_prefix,
+    };
+    let json = serde_json::to_string_pretty(&export)?;
+    std::fs::write(&file_path, json)?;
+    Ok(())
+}
+
+/// Import a profile from a previously exported JSON file.
+/// `mode_override` lets the importer choose "read-only" or "read-write" regardless of what the
+/// exporter had. If `None`, the mode stored in the file is used.
+/// The encryption key must be supplied separately — it is never stored in the export file.
+#[tauri::command]
+pub fn import_profile_config(
+    db: State<DbState>,
+    file_path: String,
+    encryption_key: String,
+    mode_override: Option<String>,
+) -> Result<profiles::CreateProfileResult, AppError> {
+    let data = std::fs::read_to_string(&file_path)?;
+    let cfg: ProfileConfigExport = serde_json::from_str(&data)
+        .map_err(|e| AppError::InvalidData(format!("Invalid profile config file: {}", e)))?;
+    let mode = mode_override.as_deref().unwrap_or(&cfg.mode);
+    let conn = db.conn()?;
+    profiles::create_profile(
+        &conn,
+        &cfg.name,
+        mode,
+        &cfg.s3_endpoint,
+        cfg.s3_region.as_deref(),
+        &cfg.s3_bucket,
+        &cfg.s3_access_key,
+        &cfg.s3_secret_key,
+        cfg.extra_env.as_deref(),
+        cfg.relative_path.as_deref(),
+        cfg.temp_directory.as_deref(),
+        Some(&encryption_key),
+        cfg.s3_key_prefix.as_deref(),
+    )
+}
+
+// ══════════════════════════════════════════════════════
 // File browser
 // ══════════════════════════════════════════════════════
 

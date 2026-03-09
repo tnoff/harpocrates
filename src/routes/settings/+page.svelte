@@ -9,6 +9,51 @@
   type EditingProfile = Profile & { s3_access_key?: string; s3_secret_key?: string };
   let editingProfile = $state<EditingProfile | null>(null);
 
+  // ── Profile config export / import ───────────────────
+
+  async function exportProfileConfig(profile: Profile) {
+    const path = await save({
+      defaultPath: `${profile.name.replace(/\s+/g, '-')}-profile.json`,
+      filters: [{ name: "Harpocrates Profile", extensions: ["json"] }],
+    });
+    if (!path) return;
+    try {
+      await invoke("export_profile_config", { profileId: profile.id, filePath: path });
+      toast.success(`Profile exported to ${path}`);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  interface ImportState { filePath: string; encryptionKey: string; mode: string; }
+  let importState = $state<ImportState | null>(null);
+  let importing = $state(false);
+
+  async function startImport() {
+    const path = await open({ filters: [{ name: "Harpocrates Profile", extensions: ["json"] }] });
+    if (!path) return;
+    importState = { filePath: path as string, encryptionKey: "", mode: "read-write" };
+  }
+
+  async function confirmImport() {
+    if (!importState) return;
+    importing = true;
+    try {
+      await invoke("import_profile_config", {
+        filePath: importState.filePath,
+        encryptionKey: importState.encryptionKey,
+        modeOverride: importState.mode,
+      });
+      toast.success("Profile imported");
+      importState = null;
+      await profileStore.load();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      importing = false;
+    }
+  }
+
   async function startEditProfile(profile: Profile) {
     try {
       const creds = await invoke<{ s3_access_key: string; s3_secret_key: string }>(
@@ -195,6 +240,7 @@
               {testingId === profile.id ? "Testing..." : "Test"}
             </button>
             <button onclick={() => startEditProfile(profile)} class="btn-xs btn-neutral">Edit</button>
+            <button onclick={() => exportProfileConfig(profile)} class="btn-xs btn-neutral">Export</button>
             <button onclick={() => deletingProfile = profile} class="btn-xs btn-destructive">Delete</button>
           </div>
         </div>
@@ -207,9 +253,14 @@
       {/each}
     </div>
 
-    <button onclick={() => editingProfile = blankProfile} class="btn-primary">
-      Add Profile
-    </button>
+    <div class="btn-row">
+      <button onclick={() => editingProfile = blankProfile} class="btn-primary">
+        Add Profile
+      </button>
+      <button onclick={startImport} class="btn-secondary">
+        Import Profile
+      </button>
+    </div>
   </section>
 
   <!-- Bandwidth -->
@@ -269,6 +320,64 @@
     </div>
   </section>
 </div>
+
+<!-- Import Profile Modal -->
+{#if importState}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="overlay"
+    onclick={() => importState = null}
+    onkeydown={(e) => e.key === "Escape" && (importState = null)}
+    role="presentation"
+  >
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="import-profile-title"
+      tabindex="-1"
+      class="modal-dialog"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
+    >
+      <h3 id="import-profile-title" class="modal-title">Import Profile</h3>
+      <p class="import-hint">
+        Enter the encryption key for this profile. The mode can be changed below — importing as
+        read-only is useful if you only need to restore or verify files.
+      </p>
+
+      <div class="import-filepath">{importState.filePath}</div>
+
+      <div class="import-field">
+        <label class="form-label" for="import-enc-key">Encryption Key</label>
+        <input
+          id="import-enc-key"
+          type="password"
+          class="form-input"
+          placeholder="Paste your encryption key"
+          bind:value={importState.encryptionKey}
+        />
+      </div>
+
+      <div class="import-field">
+        <label class="form-label" for="import-mode">Access Mode</label>
+        <select id="import-mode" class="form-input" bind:value={importState.mode}>
+          <option value="read-write">Read-write</option>
+          <option value="read-only">Read-only</option>
+        </select>
+      </div>
+
+      <button
+        onclick={confirmImport}
+        disabled={importing || !importState.encryptionKey.trim()}
+        class="btn-primary"
+        style="margin-top: 0.5rem;"
+      >
+        {importing ? "Importing..." : "Import"}
+      </button>
+      <button onclick={() => importState = null} class="btn-cancel-link">Cancel</button>
+    </div>
+  </div>
+{/if}
 
 <!-- Edit / Create Profile Modal -->
 {#if editingProfile}
@@ -556,6 +665,32 @@
   .btn-destructive { background: #fee2e2; color: #ef4444; }
   .btn-destructive:hover { background: #fecaca; }
 
+  /* Import modal */
+  .import-hint {
+    font-size: 0.8125rem;
+    color: #64748b;
+    margin: 0 0 0.75rem;
+  }
+
+  .import-filepath {
+    font-size: 0.75rem;
+    font-family: monospace;
+    color: #475569;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 0.375rem;
+    padding: 0.375rem 0.625rem;
+    margin-bottom: 0.75rem;
+    word-break: break-all;
+  }
+
+  .import-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    margin-bottom: 0.75rem;
+  }
+
   /* Modal */
   .overlay {
     position: fixed;
@@ -602,6 +737,8 @@
 
   /* Dark mode */
   @media (prefers-color-scheme: dark) {
+    .import-hint { color: #94a3b8; }
+    .import-filepath { background: #0f172a; border-color: #334155; color: #94a3b8; }
     .section-hint { color: #94a3b8; }
     .profile-row { background: #1e293b; border-color: #334155; }
     .profile-meta { color: #94a3b8; }

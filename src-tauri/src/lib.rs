@@ -86,6 +86,9 @@ pub fn run() {
             // Phase 11: Export/Import
             commands::export_database,
             commands::import_database,
+            // Phase 12: Profile config export/import
+            commands::export_profile_config,
+            commands::import_profile_config,
             // File browser
             commands::list_files,
             commands::delete_backup_entries,
