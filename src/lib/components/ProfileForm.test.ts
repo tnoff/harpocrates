@@ -11,30 +11,15 @@ beforeEach(() => {
 });
 
 describe('ProfileForm — encryption key section (read-write)', () => {
-  it('shows the generate-key warning by default', () => {
+  it('shows the key input directly without a checkbox', () => {
     render(ProfileForm, { onsubmit: noop });
-    expect(screen.getByText(/new encryption key will be generated/i)).toBeInTheDocument();
-  });
-
-  it('shows the import checkbox', () => {
-    render(ProfileForm, { onsubmit: noop });
-    expect(screen.getByRole('checkbox', { name: /import existing encryption key/i })).toBeInTheDocument();
-  });
-
-  it('checking the import checkbox shows the key input and hides the warning', async () => {
-    render(ProfileForm, { onsubmit: noop });
-    await fireEvent.click(screen.getByRole('checkbox', { name: /import existing encryption key/i }));
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
     expect(screen.getByLabelText(/^encryption key$/i)).toBeInTheDocument();
-    expect(screen.queryByText(/new encryption key will be generated/i)).not.toBeInTheDocument();
   });
 
-  it('unchecking the import checkbox hides the key input and restores the warning', async () => {
+  it('shows the leave-blank hint', () => {
     render(ProfileForm, { onsubmit: noop });
-    const checkbox = screen.getByRole('checkbox', { name: /import existing encryption key/i });
-    await fireEvent.click(checkbox);
-    await fireEvent.click(checkbox);
-    expect(screen.queryByLabelText(/^encryption key$/i)).not.toBeInTheDocument();
-    expect(screen.getByText(/new encryption key will be generated/i)).toBeInTheDocument();
+    expect(screen.getByText(/leave blank to generate a new one/i)).toBeInTheDocument();
   });
 });
 
@@ -60,13 +45,14 @@ describe('ProfileForm — encryption key section (read-only)', () => {
     expect(screen.queryByText(/new encryption key will be generated/i)).not.toBeInTheDocument();
   });
 
-  it('switching to read-write restores the checkbox and warning', async () => {
+  it('switching to read-write still shows the key input field', async () => {
     render(ProfileForm, { onsubmit: noop, initial: { mode: 'read-only' } });
     const select = screen.getByRole('combobox', { name: /mode/i });
     select.value = 'read-write';
     await fireEvent.change(select);
-    expect(screen.getByRole('checkbox', { name: /import existing encryption key/i })).toBeInTheDocument();
-    expect(screen.getByText(/new encryption key will be generated/i)).toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/^encryption key$/i)).toBeInTheDocument();
+    expect(screen.getByText(/leave blank to generate a new one/i)).toBeInTheDocument();
   });
 });
 
@@ -147,10 +133,9 @@ describe('ProfileForm — submission', () => {
     );
   });
 
-  it('passes the key when read-write with import checked', async () => {
+  it('passes the key when read-write and key is filled in', async () => {
     const mockSubmit = vi.fn().mockResolvedValue(undefined);
     const { container } = render(ProfileForm, { onsubmit: mockSubmit });
-    await fireEvent.click(screen.getByRole('checkbox', { name: /import existing encryption key/i }));
     await fireEvent.input(screen.getByLabelText(/^encryption key$/i), {
       target: { value: 'aabbcc' },
     });
