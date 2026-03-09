@@ -6,7 +6,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
 use md5::{Digest, Md5};
-use rand::RngCore;
+use rand::RngExt;
 
 use crate::error::AppError;
 
@@ -63,8 +63,8 @@ pub fn encrypt_file(
     // Generate random salt and nonce
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill(&mut salt);
+    rand::rng().fill(&mut nonce_bytes);
 
     // Derive key from passphrase + salt
     let key = derive_key(passphrase.as_bytes(), &salt)?;
