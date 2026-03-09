@@ -1,4 +1,4 @@
-use rand::RngCore;
+use rand::RngExt;
 use rusqlite::Connection;
 
 use crate::credentials;
@@ -13,7 +13,7 @@ pub struct CreateProfileResult {
 
 pub fn generate_encryption_key() -> String {
     let mut key_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill(&mut key_bytes);
     hex::encode(key_bytes)
 }
 
