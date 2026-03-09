@@ -60,7 +60,8 @@ pub fn get_table_count(db: State<DbState>) -> Result<usize, AppError> {
     let mut stmt = conn.prepare(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )?;
-    let count: usize = stmt.query_row([], |row: &rusqlite::Row| row.get(0))?;
+    let count: i64 = stmt.query_row([], |row: &rusqlite::Row| row.get(0))?;
+    let count = count as usize;
     Ok(count)
 }
 
