@@ -53,11 +53,10 @@
   let tempDirectory = $state(iv.tempDirectory);
   let s3KeyPrefix = $state(iv.s3KeyPrefix);
   let importKey = $state("");
-  let useImportKey = $state(false);
+
 
   let isReadOnly = $derived(mode === "read-only");
-  // Read-only profiles must always import an existing key — generating one makes no sense.
-  let effectiveUseImportKey = $derived(isReadOnly || useImportKey);
+
 
   let submitting = $state(false);
   let testing = $state(false);
@@ -92,7 +91,7 @@
         extra_env: extraEnv || null,
         relative_path: relativePath || null,
         temp_directory: tempDirectory || null,
-        import_encryption_key: effectiveUseImportKey && importKey ? importKey : null,
+        import_encryption_key: importKey || null,
         s3_key_prefix: s3KeyPrefix.trim() || null,
       });
     } catch (e) {
@@ -237,21 +236,10 @@
         </div>
       {:else}
         <div>
-          <label style="display: flex; align-items: center; gap: 0.625rem; font-size: 0.875rem; cursor: pointer;">
-            <input type="checkbox" bind:checked={useImportKey} class="w-4 h-4 rounded accent-primary" />
-            Import existing encryption key
-          </label>
-          <p class="form-hint">Check this if you're reconnecting to an existing vault and already have its encryption key.</p>
+          <label class="form-label" for="pf-import-key">Encryption Key</label>
+          <input id="pf-import-key" bind:value={importKey} type="password" class="form-input" placeholder="Paste your 64-character hex key" />
+          <p class="form-hint">If you have an existing key, paste it here. Leave blank to generate a new one — save it after creation, it cannot be recovered if lost.</p>
         </div>
-        {#if useImportKey}
-          <div>
-            <label class="form-label" for="pf-import-key">Encryption Key</label>
-            <input id="pf-import-key" bind:value={importKey} type="password" class="form-input" placeholder="Paste your 64-character hex key" />
-            <p class="form-hint">Must be the exact 64-character hex key used when the vault was originally created.</p>
-          </div>
-        {:else}
-          <p class="form-warning">⚠ A new encryption key will be generated. You must save it — it cannot be recovered if lost.</p>
-        {/if}
       {/if}
     </fieldset>
   {/if}
