@@ -10,6 +10,7 @@ export interface Profile {
   extra_env: string | null;
   relative_path: string | null;
   temp_directory: string | null;
+  s3_key_prefix: string | null;
   is_active: boolean;
   created_at: string;
 }

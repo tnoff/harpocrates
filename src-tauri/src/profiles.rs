@@ -17,6 +17,32 @@ pub fn generate_encryption_key() -> String {
     hex::encode(key_bytes)
 }
 
+/// Validate and normalize an S3 key prefix.
+/// Returns `None` for empty/whitespace-only input (meaning no prefix).
+/// Strips leading/trailing whitespace and slashes.
+fn validate_s3_key_prefix(prefix: &str) -> Result<Option<String>, AppError> {
+    let trimmed = prefix.trim().trim_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > 200 {
+        return Err(AppError::Config(
+            "S3 key prefix must not exceed 200 characters".into(),
+        ));
+    }
+    if trimmed.contains("//") {
+        return Err(AppError::Config(
+            "S3 key prefix must not contain consecutive slashes".into(),
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(AppError::Config(
+            "S3 key prefix contains invalid characters".into(),
+        ));
+    }
+    Ok(Some(trimmed))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_profile(
     conn: &Connection,
@@ -31,6 +57,7 @@ pub fn create_profile(
     relative_path: Option<&str>,
     temp_directory: Option<&str>,
     import_encryption_key: Option<&str>,
+    s3_key_prefix: Option<&str>,
 ) -> Result<CreateProfileResult, AppError> {
     // Validate mode
     if mode != "read-write" && mode != "read-only" {
@@ -39,6 +66,11 @@ pub fn create_profile(
             mode
         )));
     }
+
+    let validated_prefix = match s3_key_prefix {
+        Some(p) => validate_s3_key_prefix(p)?,
+        None => None,
+    };
 
     // Insert profile into DB (UNIQUE constraint on endpoint+bucket will catch duplicates)
     let profile_id = db::insert_profile(
@@ -51,6 +83,7 @@ pub fn create_profile(
         extra_env,
         relative_path,
         temp_directory,
+        validated_prefix.as_deref(),
     )?;
 
     // Generate or import encryption key
@@ -107,6 +140,7 @@ pub fn update_profile(
     extra_env: Option<Option<&str>>,
     relative_path: Option<Option<&str>>,
     temp_directory: Option<Option<&str>>,
+    s3_key_prefix: Option<Option<&str>>,
 ) -> Result<db::Profile, AppError> {
     let existing = db::get_profile_by_id(conn, id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", id)))?;
@@ -140,11 +174,16 @@ pub fn update_profile(
         Some(t) => t.map(|s| s.to_string()),
         None => existing.temp_directory.clone(),
     };
+    let new_s3_key_prefix = match s3_key_prefix {
+        Some(Some(p)) => validate_s3_key_prefix(p)?,
+        Some(None) => None,
+        None => existing.s3_key_prefix.clone(),
+    };
 
     // Delete and re-insert (simple approach for updates with unique constraints)
     conn.execute(
-        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5, extra_env=?6, relative_path=?7, temp_directory=?8 WHERE id=?9",
-        rusqlite::params![new_name, new_mode, new_endpoint, new_region, new_bucket, new_extra_env, new_relative_path, new_temp_directory, id],
+        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5, extra_env=?6, relative_path=?7, temp_directory=?8, s3_key_prefix=?9 WHERE id=?10",
+        rusqlite::params![new_name, new_mode, new_endpoint, new_region, new_bucket, new_extra_env, new_relative_path, new_temp_directory, new_s3_key_prefix, id],
     )?;
 
     // Update keychain credentials if changed
@@ -261,6 +300,7 @@ mod tests {
                 extra_env TEXT,
                 relative_path TEXT,
                 temp_directory TEXT,
+                s3_key_prefix TEXT,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(s3_endpoint, s3_bucket)
@@ -317,7 +357,7 @@ mod tests {
     fn test_get_active_profile_found() {
         let conn = setup_db();
         let id = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
         ).unwrap();
         db::set_active_profile(&conn, id).unwrap();
         let result = get_active_profile(&conn).unwrap();
@@ -329,10 +369,10 @@ mod tests {
     fn test_switch_profile() {
         let conn = setup_db();
         let id1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None,
+            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None,
         ).unwrap();
         let id2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None,
+            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None,
         ).unwrap();
 
         let profile = switch_profile(&conn, id1).unwrap();
@@ -361,9 +401,74 @@ mod tests {
         let conn = setup_db();
         let result = create_profile(
             &conn, "test", "invalid-mode", "https://s3.test.com", None, "bucket",
-            "ak", "sk", None, None, None, None,
+            "ak", "sk", None, None, None, None, None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid profile mode"));
+    }
+
+    // ── validate_s3_key_prefix tests ──
+
+    #[test]
+    fn test_validate_prefix_none_input() {
+        // None = no prefix wanted, always fine
+        assert_eq!(validate_s3_key_prefix("").unwrap(), None);
+        assert_eq!(validate_s3_key_prefix("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn test_validate_prefix_strips_slashes_and_whitespace() {
+        assert_eq!(
+            validate_s3_key_prefix("  /team-alpha/  ").unwrap(),
+            Some("team-alpha".to_string())
+        );
+        assert_eq!(
+            validate_s3_key_prefix("/foo/bar/").unwrap(),
+            Some("foo/bar".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_prefix_simple_value() {
+        assert_eq!(
+            validate_s3_key_prefix("team-alpha").unwrap(),
+            Some("team-alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_prefix_nested_path() {
+        assert_eq!(
+            validate_s3_key_prefix("org/team/backups").unwrap(),
+            Some("org/team/backups".to_string())
+        );
+    }
+
+    #[test]
+    fn test_validate_prefix_rejects_double_slash() {
+        let result = validate_s3_key_prefix("foo//bar");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("consecutive slashes"));
+    }
+
+    #[test]
+    fn test_validate_prefix_rejects_over_200_chars() {
+        let long = "a".repeat(201);
+        let result = validate_s3_key_prefix(&long);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("200"));
+    }
+
+    #[test]
+    fn test_validate_prefix_accepts_exactly_200_chars() {
+        let edge = "a".repeat(200);
+        assert!(validate_s3_key_prefix(&edge).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_validate_prefix_rejects_control_chars() {
+        let result = validate_s3_key_prefix("foo\x01bar");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid characters"));
     }
 }

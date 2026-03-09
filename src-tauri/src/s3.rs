@@ -224,7 +224,7 @@ impl S3Client {
         Ok(())
     }
 
-    pub async fn list_objects(&self) -> Result<Vec<S3Object>, AppError> {
+    pub async fn list_objects(&self, prefix: Option<&str>) -> Result<Vec<S3Object>, AppError> {
         let mut objects = Vec::new();
         let mut continuation_token: Option<String> = None;
 
@@ -233,6 +233,10 @@ impl S3Client {
                 .client
                 .list_objects_v2()
                 .bucket(&self.bucket);
+
+            if let Some(p) = prefix {
+                req = req.prefix(p);
+            }
 
             if let Some(token) = &continuation_token {
                 req = req.continuation_token(token);

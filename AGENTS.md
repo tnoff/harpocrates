@@ -47,7 +47,8 @@ harpocrates/
 │   ├── lib.rs              # App entry, managed state, invoke_handler registry
 │   ├── main.rs             # Binary entry point (calls harpocrates_lib::run())
 │   ├── commands.rs         # Every #[tauri::command] fn
-│   ├── backup.rs           # Directory backup: change detection, dedup, skip patterns
+│   ├── backup.rs           # Directory backup: change detection, dedup, skip patterns; make_s3_key()
+│   ├── queue.rs            # Serial OperationQueue for all S3-touching ops; emits queue/op/progress events
 │   ├── s3.rs               # S3Client: upload, download, list, multipart, throttle
 │   ├── crypto.rs           # AES-256-GCM + Argon2id; temp file prefix: "harpocrates-tmp-"
 │   ├── db.rs               # SQLite schema + CRUD
@@ -145,6 +146,29 @@ export const myStore = {
   add(item: string) { items = [...items, item]; },
 };
 ```
+
+---
+
+## Operation Queue Architecture
+
+All S3-touching operations (backup, restore, scramble, verify, cleanup) go through a single **serial Rust queue** in `queue.rs`. This keeps S3 access single-threaded and provides a unified progress/cancel model.
+
+```
+Frontend                    Rust
+--------                    ----
+invoke("backup_directory")
+  → queue.enqueue(...)  →   OperationQueue (FIFO channel)
+  ← op_id string            worker task runs one op at a time
+                              emits: queue:updated, backup:progress, op:complete / op:failed
+invoke("cancel_operation", { opId })
+  → queue.cancel(op_id) →   sets AtomicBool flag; current file finishes, then op stops
+```
+
+- **Enqueue returns immediately** with a string `op_id` — the frontend never `await`s the work itself.
+- **Events** drive UI updates: `queue:updated` (full snapshot of pending + active), `op:complete`, `op:failed`, and per-op progress events (`backup:progress`, `restore:progress`, etc.).
+- **Cancellation** for pending ops removes them from the queue immediately; for the active op it sets a flag and the op stops after the current file.
+
+The frontend mirrors this with the `operationsStore` (see below).
 
 ---
 
@@ -258,23 +282,29 @@ app.emit("my:progress", MyProgress { processed: i, total: n }).ok();
 Use `AppError` variants from `error.rs`. The `#[from]` derives handle `?` conversions:
 
 ```rust
-// Variants: Io, S3, Crypto, Db, Credential, Config, General
-return Err(AppError::General("something went wrong".into()));
+// Variants: Database, Io, Config, Serialization, Crypto, S3, Credential, Lock, NotFound, InvalidData
+return Err(AppError::Config("something went wrong".into()));
 ```
 
 ### Database
 
-SQLite at `~/.harpocrates/harpocrates.db`. Schema managed in `db.rs`.
+SQLite at `~/.harpocrates/harpocrates.db`. Schema managed in `db.rs`. Current schema version: **3** (migrations run automatically in `init_database` on first open).
 
 | Table | Key columns |
 |-------|-------------|
-| `profile` | id, name, mode, s3_endpoint, s3_bucket, relative_path, is_active |
-| `backup_entry` | id, s3_key (UUID), original_md5, encrypted_md5, file_size |
-| `local_file` | id, backup_entry_id, local_path, file_name |
-| `share_manifest` | id, uuid, name, created_at |
-| `share_manifest_entry` | manifest_id, backup_entry_id, file_name |
+| `profile` | id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, is_active |
+| `backup_entry` | id, profile_id, object_uuid, original_md5, encrypted_md5, file_size |
+| `local_file` | id, backup_entry_id, local_path, cached_mtime, cached_size |
+| `share_manifest` | id, profile_id, manifest_uuid, label, file_count, is_valid |
+| `share_manifest_entry` | id, share_manifest_id, backup_entry_id, filename |
+
+**`object_uuid`** in `backup_entry` is the full S3 object key — it includes the profile's `s3_key_prefix` if one is set (e.g. `team-alpha/550e8400-...`). Never strip or reformat this value before passing it to S3 operations.
 
 Deduplication works by matching `original_md5` — two local files with identical content share one `backup_entry` and one S3 object.
+
+**`relative_path`** (profile field) is a local filesystem prefix stripped from file paths before they are stored in `local_file.local_path`. It is used to make stored paths relative so they can be restored on a different machine. It has no effect on S3 object keys.
+
+**`s3_key_prefix`** (profile field) is prepended to every S3 object key for this profile, enabling per-prefix IAM policies on a shared bucket. Use `backup::make_s3_key(prefix, uuid)` to construct keys — never format them manually. Validated and normalised by `profiles::validate_s3_key_prefix` (strips surrounding slashes/whitespace, rejects `//` and control characters, max 200 chars).
 
 ### Keyring
 
@@ -314,6 +344,7 @@ The release CI runs `node scripts/set-version.mjs` to stamp the version into `Ca
 
 ## Tests
 
+**Rust:**
 ```bash
 cd src-tauri
 cargo test --lib
@@ -321,8 +352,14 @@ cargo test --lib
 
 Unit tests are in `#[cfg(test)] mod tests { ... }` blocks at the bottom of each Rust file. Use `tempfile::tempdir()` for filesystem tests. Integration tests (in-memory SQLite) live in `integration_tests.rs`.
 
-Frontend type-checking:
+**Frontend unit tests (vitest + Testing Library):**
+```bash
+npm test
+```
 
+Frontend tests live alongside their subjects (`ProfileForm.test.ts`, `share/page.test.ts`, `stores/*.test.ts`). Mock Tauri's `invoke` via `vi.mock('@tauri-apps/api/core')` — the global mock is set up in `vitest.setup.ts`.
+
+**Frontend type-checking:**
 ```bash
 npm run check
 ```

@@ -11,6 +11,7 @@ const mockProfile = (overrides: Partial<Profile> = {}): Profile => ({
   extra_env: null,
   relative_path: null,
   temp_directory: null,
+  s3_key_prefix: null,
   is_active: true,
   created_at: '2024-01-01T00:00:00Z',
   ...overrides,

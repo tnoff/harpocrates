@@ -9,9 +9,9 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }));
 const mockInvoke = vi.mocked(invoke);
 
 const mockFiles = [
-  { id: 1, object_uuid: 'uuid-1', filename: 'alpha.txt', local_path: '/a/alpha.txt', file_size: 1024,   original_md5: 'md5a', created_at: '2024-01-01' },
-  { id: 2, object_uuid: 'uuid-2', filename: 'beta.txt',  local_path: '/a/beta.txt',  file_size: 2048,   original_md5: 'md5b', created_at: '2024-01-02' },
-  { id: 3, object_uuid: 'uuid-3', filename: 'gamma.txt', local_path: '/a/gamma.txt', file_size: 512,    original_md5: 'md5c', created_at: '2024-01-03' },
+  { id: 1, object_uuid: 'uuid-1', filename: 'alpha.txt', local_path: '/home/user/Music/Some Artist/alpha.txt', file_size: 1024,   original_md5: 'md5a', created_at: '2024-01-01' },
+  { id: 2, object_uuid: 'uuid-2', filename: 'beta.txt',  local_path: '/home/user/Music/Some Artist/beta.txt',  file_size: 2048,   original_md5: 'md5b', created_at: '2024-01-02' },
+  { id: 3, object_uuid: 'uuid-3', filename: 'gamma.txt', local_path: '/home/user/Documents/gamma.txt',         file_size: 512,    original_md5: 'md5c', created_at: '2024-01-03' },
 ];
 
 function setupInvoke({ files = mockFiles, createUuid = 'test-uuid-1234' } = {}) {
@@ -161,6 +161,37 @@ describe('Share page — search filtering', () => {
     search.value = '';
     await fireEvent.input(search);
     expect(screen.getByText('2 selected')).toBeInTheDocument();
+  });
+});
+
+describe('Share page — search by local path', () => {
+  it('matches files by directory name in local_path', async () => {
+    await renderAndWait();
+    const search = screen.getByPlaceholderText(/search files/i);
+    search.value = 'Some Artist';
+    await fireEvent.input(search);
+    expect(screen.getByText('alpha.txt')).toBeInTheDocument();
+    expect(screen.getByText('beta.txt')).toBeInTheDocument();
+    expect(screen.queryByText('gamma.txt')).not.toBeInTheDocument();
+  });
+
+  it('matches files by partial path segment', async () => {
+    await renderAndWait();
+    const search = screen.getByPlaceholderText(/search files/i);
+    search.value = 'Documents';
+    await fireEvent.input(search);
+    expect(screen.queryByText('alpha.txt')).not.toBeInTheDocument();
+    expect(screen.queryByText('beta.txt')).not.toBeInTheDocument();
+    expect(screen.getByText('gamma.txt')).toBeInTheDocument();
+  });
+
+  it('path search is case-insensitive', async () => {
+    await renderAndWait();
+    const search = screen.getByPlaceholderText(/search files/i);
+    search.value = 'some artist';
+    await fireEvent.input(search);
+    expect(screen.getByText('alpha.txt')).toBeInTheDocument();
+    expect(screen.getByText('beta.txt')).toBeInTheDocument();
   });
 });
 

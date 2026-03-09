@@ -85,7 +85,8 @@ harpocrates
    - **S3 Endpoint** — e.g. `https://s3.amazonaws.com` for AWS, or your provider's URL
    - **Region** — e.g. `us-east-1` (leave blank if your provider doesn't require it)
    - **Bucket** — the S3 bucket name
-   - **Access Key / Secret Key** — your S3 credentials
+   - **Access Key / Secret Key** — your S3 credentials (must be generated in your provider's IAM console beforehand; Harpocrates cannot create these for you)
+   - **Key Prefix** — optional sub-path within the bucket (e.g. `team-alpha`); useful for restricting IAM policies to a specific prefix
 3. Click **Create Profile**.
 4. **Copy and save your encryption key.** This key is generated fresh and displayed once. Harpocrates does not store it anywhere. If you lose it, your files cannot be decrypted.
 5. Click **I've saved my key — Continue**.
@@ -132,6 +133,43 @@ Both tabs support a dry-run mode that shows what would be deleted without making
 
 ---
 
+## S3 Credential Management
+
+**Harpocrates does not create, rotate, or manage S3 credentials.** You are entirely responsible for provisioning access keys and configuring permissions on your storage provider. This includes:
+
+- Creating IAM users, roles, or API tokens with appropriate bucket permissions
+- Rotating credentials when needed
+- Scoping permissions to the minimum required (see below)
+- Revoking credentials if they are compromised
+
+Harpocrates only stores the credentials you provide in the OS keychain and uses them when making S3 API calls. It has no knowledge of your provider's IAM system and cannot automate any part of credential lifecycle management.
+
+### Recommended minimum permissions
+
+For a read-write profile, the access key needs:
+
+```
+s3:PutObject
+s3:GetObject
+s3:DeleteObject
+s3:ListBucket
+s3:HeadBucket
+```
+
+For a read-only profile:
+
+```
+s3:GetObject
+s3:ListBucket
+s3:HeadBucket
+```
+
+### Key Prefix and IAM scoping
+
+Each profile can optionally set a **Key Prefix** (e.g. `team-alpha`). All objects for that profile are then stored at `{prefix}/{uuid}` instead of bare `{uuid}`. This lets you scope IAM policies to a sub-path of a shared bucket — for example, granting one set of credentials access only to `team-alpha/*` and another to `team-beta/*`. Harpocrates does not configure these policies; you must set them up in your provider's IAM console.
+
+---
+
 ## Data Layout on S3
 
 Every file is stored as a randomly generated UUID with no extension or readable metadata.
@@ -143,11 +181,13 @@ s3://your-bucket/
   ...
 ```
 
-If you configure a **Relative Path** prefix in your profile, all objects are stored under it:
+If a **Key Prefix** is configured in the profile, all objects are stored under it:
 
 ```
-s3://your-bucket/backups/
-  backups/550e8400-...
+s3://your-bucket/
+  team-alpha/550e8400-e29b-41d4-a716-446655440000
+  team-alpha/6ba7b810-9dad-11d1-80b4-00c04fd430c8
+  ...
 ```
 
 ---
