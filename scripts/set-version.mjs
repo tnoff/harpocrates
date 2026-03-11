@@ -1,21 +1,16 @@
 /**
- * Reads the VERSION file and stamps the version into Cargo.toml and package.json.
+ * Reads the version from package.json and stamps it into Cargo.toml.
  * Run with: node scripts/set-version.mjs
  */
 import { readFileSync, writeFileSync } from "fs";
 
-const version = readFileSync("VERSION", "utf8").trim();
+const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+const version = pkg.version;
 
 // Update src-tauri/Cargo.toml
 const cargoPath = "src-tauri/Cargo.toml";
 let cargo = readFileSync(cargoPath, "utf8");
 cargo = cargo.replace(/^version = "[^"]*"/m, `version = "${version}"`);
 writeFileSync(cargoPath, cargo);
-
-// Update package.json
-const pkgPath = "package.json";
-const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-pkg.version = version;
-writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
 
 console.log(`Version set to ${version}`);

@@ -1,4 +1,4 @@
-name: Tag Build
+name: Release
 
 on:
   push:
@@ -6,9 +6,11 @@ on:
 
 jobs:
   tag:
-    uses: tnoff/github-workflows/.github/workflows/tag.yml@39e12f56e2a091e61ba84b1d8615d176f11f49a2
+    uses: tnoff/github-workflows/.github/workflows/tag.yml@bcd92d35de2f78d9b6e2ed9d69637561e47c93dc
     with:
-      version_file: './VERSION'
+      version_file: './package.json'
+      version_file_type: json
+      version_json_key: version
     permissions:
       contents: write
 
@@ -65,11 +67,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Set version from VERSION file
+      - name: Set version from package.json
         id: version
         run: |
           node scripts/set-version.mjs
-          node -e "process.stdout.write('version=' + require('fs').readFileSync('VERSION','utf8').trim() + '\n')" >> "$GITHUB_OUTPUT"
+          node -e "process.stdout.write('version=' + require('./package.json').version + '\n')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Build Tauri app
