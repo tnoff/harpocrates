@@ -36,6 +36,7 @@ mod tests {
                 relative_path TEXT,
                 temp_directory TEXT,
                 s3_key_prefix TEXT,
+                upload_chunk_size_mb INTEGER,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(s3_endpoint, s3_bucket)
@@ -90,6 +91,7 @@ mod tests {
             &format!("https://s3.example.com/{}", name),
             None,
             "test-bucket",
+            None,
             None,
             None,
             None,

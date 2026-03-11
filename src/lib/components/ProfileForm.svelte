@@ -17,6 +17,7 @@
       relative_path?: string | null;
       temp_directory?: string | null;
       s3_key_prefix?: string | null;
+      upload_chunk_size_mb?: number | null;
     };
     onsubmit: (data: Record<string, unknown>) => Promise<void>;
     submitLabel?: string;
@@ -39,6 +40,7 @@
     relativePath: initial.relative_path ?? "",
     tempDirectory: initial.temp_directory ?? "",
     s3KeyPrefix: initial.s3_key_prefix ?? "",
+    uploadChunkSizeMb: initial.upload_chunk_size_mb ?? 256,
   }));
 
   let name = $state(iv.name);
@@ -52,6 +54,7 @@
   let relativePath = $state(iv.relativePath);
   let tempDirectory = $state(iv.tempDirectory);
   let s3KeyPrefix = $state(iv.s3KeyPrefix);
+  let uploadChunkSizeMb = $state(iv.uploadChunkSizeMb);
   let importKey = $state("");
 
 
@@ -93,6 +96,7 @@
         temp_directory: tempDirectory || null,
         import_encryption_key: importKey || null,
         s3_key_prefix: s3KeyPrefix.trim() || null,
+        upload_chunk_size_mb: uploadChunkSizeMb > 0 ? uploadChunkSizeMb : null,
       });
     } catch (e) {
       error = String(e);
@@ -221,6 +225,11 @@
         >Browse</button>
       </div>
       <p class="form-hint">Local folder for temporary files during transfers. Defaults to your system temp folder if left blank.</p>
+    </div>
+    <div>
+      <label class="form-label" for="pf-chunk-size">Upload chunk size (MB)</label>
+      <input id="pf-chunk-size" type="number" min="5" max="10240" bind:value={uploadChunkSizeMb} class="form-input" style="max-width: 12rem;" />
+      <p class="form-hint">Files are encrypted and uploaded in chunks of this size. Larger chunks mean fewer S3 requests and faster transfers, but each chunk uses ~2× this amount of RAM. Default: 256 MB.</p>
     </div>
   </fieldset>
 

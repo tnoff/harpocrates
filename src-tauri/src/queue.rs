@@ -107,6 +107,20 @@ struct CleanupProgressEvent {
     failed: usize,
 }
 
+/// Emitted repeatedly during a single-file backup to show byte-level progress.
+/// `phase` is one of "Checksumming", "Encrypting", "Uploading".
+/// `bytes_done`/`bytes_total` span the full operation (encryption + upload) for the progress bar.
+/// `phase_done`/`phase_total` are relative to the current phase only, for the byte label.
+#[derive(serde::Serialize, Clone)]
+struct UploadProgressEvent {
+    op_id: String,
+    bytes_done: u64,
+    bytes_total: u64,
+    phase: String,
+    phase_done: u64,
+    phase_total: u64,
+}
+
 /// Emitted once at the start of an operation with the full list of items
 /// that will be processed, so the frontend can show a "remaining" list.
 #[derive(serde::Serialize, Clone)]
@@ -165,6 +179,9 @@ pub enum OpParams {
     },
     VerifyIntegrity {
         backup_entry_ids: Vec<i64>,
+    },
+    BackupFile {
+        file_path: String,
     },
 }
 
@@ -367,6 +384,14 @@ fn get_temp_dir(profile: &db::Profile) -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+fn profile_chunk_size(profile: &db::Profile) -> usize {
+    profile
+        .upload_chunk_size_mb
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb as usize * 1024 * 1024)
+        .unwrap_or(crypto::DEFAULT_CHUNK_SIZE)
+}
+
 async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
     let access_key = credentials::get_s3_access_key(&profile.name)?;
     let secret_key = credentials::get_s3_secret_key(&profile.name)?;
@@ -378,6 +403,7 @@ async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
         &secret_key,
         profile.extra_env.as_deref(),
         crate::throttle::global().clone(),
+        profile_chunk_size(profile),
     )
     .await
 }
@@ -414,10 +440,187 @@ async fn run_op(
         OpParams::VerifyIntegrity { backup_entry_ids } => {
             run_verify_integrity(app, op_id, backup_entry_ids).await
         }
+        OpParams::BackupFile { file_path } => {
+            run_backup_file(app, op_id, &file_path).await
+        }
     }
 }
 
 // ── BackupDirectory ───────────────────────────────────────────────────────────
+
+async fn run_backup_file(
+    app: &AppHandle,
+    op_id: &str,
+    file_path: &str,
+) -> Result<String, AppError> {
+    let name = Path::new(file_path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string());
+
+    let _ = app.emit(
+        "op:pending_files",
+        OpPendingFilesEvent { op_id: op_id.to_string(), files: vec![name.clone()] },
+    );
+
+    // Emit immediately so the progress bar appears before the MD5 read of a large file.
+    let _ = app.emit(
+        "backup:progress",
+        BackupProgressEvent {
+            op_id: op_id.to_string(),
+            processed: 0,
+            total: 1,
+            uploaded: 0,
+            deduped: 0,
+            skipped: 0,
+            failed: 0,
+            current_file: name.clone(),
+        },
+    );
+
+    let (profile, encryption_key, temp_dir, existing_entry, stored_path) = {
+        let db = app.state::<DbState>();
+        let conn = db.conn()?;
+        let profile = get_active_profile_or_err(&conn)?;
+        let encryption_key = get_profile_encryption_key(&profile)?;
+        let temp_dir = get_temp_dir(&profile);
+        let stored_path = backup::strip_relative_path(file_path, profile.relative_path.as_deref());
+
+        let _ = app.emit(
+            "upload:progress",
+            UploadProgressEvent { op_id: op_id.to_string(), bytes_done: 0, bytes_total: 1, phase: "Checksumming".into(), phase_done: 0, phase_total: 0 },
+        );
+        let original_md5 = crypto::compute_file_md5(Path::new(file_path))?;
+        let existing: Option<db::BackupEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
+                 FROM backup_entry WHERE profile_id = ?1 AND original_md5 = ?2 LIMIT 1",
+            )?;
+            stmt.query_row(rusqlite::params![profile.id, original_md5], |row| {
+                Ok(db::BackupEntry {
+                    id: row.get(0)?,
+                    profile_id: row.get(1)?,
+                    object_uuid: row.get(2)?,
+                    original_md5: row.get(3)?,
+                    encrypted_md5: row.get(4)?,
+                    file_size: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .optional()?
+        };
+
+        if let Some(ref entry) = existing {
+            let metadata = std::fs::metadata(Path::new(file_path))?;
+            let mtime = metadata.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64());
+            let size = metadata.len() as i64;
+            db::insert_local_file(&conn, entry.id, &stored_path, mtime, Some(size))?;
+            let _ = app.emit(
+                "backup:progress",
+                BackupProgressEvent {
+                    op_id: op_id.to_string(),
+                    processed: 1,
+                    total: 1,
+                    uploaded: 0,
+                    deduped: 1,
+                    skipped: 0,
+                    failed: 0,
+                    current_file: name,
+                },
+            );
+            return Ok("1 deduped".to_string());
+        }
+
+        (profile, encryption_key, temp_dir, existing, stored_path)
+    };
+    let _ = existing_entry;
+
+    let temp_path = crypto::generate_temp_path(&temp_dir);
+
+    // Treat encryption + upload as one seamless 0→100% fill.
+    // Total = file_size (encryption) + encrypted_file_size (upload).
+    // We estimate encrypted_size ≈ file_size (overhead is a few KB per MB, negligible).
+    let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+    let total_estimate = file_size.saturating_mul(2).max(1);
+
+    let app_enc = app.clone();
+    let op_id_enc = op_id.to_string();
+    let encrypt_result = crypto::encrypt_file_with_progress(
+        Path::new(file_path),
+        &temp_path,
+        &encryption_key,
+        move |enc_done, _| {
+            let _ = app_enc.emit(
+                "upload:progress",
+                UploadProgressEvent { op_id: op_id_enc.clone(), bytes_done: enc_done, bytes_total: total_estimate, phase: "Encrypting".into(), phase_done: enc_done, phase_total: file_size },
+            );
+        },
+    )?;
+
+    let object_uuid = backup::make_s3_key(
+        profile.s3_key_prefix.as_deref(),
+        &uuid::Uuid::new_v4().to_string(),
+    );
+    let encrypted_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(file_size);
+    let total_actual = file_size + encrypted_size;
+
+    let s3 = build_s3_client(&profile).await?;
+    let app_progress = app.clone();
+    let op_id_progress = op_id.to_string();
+    let upload_result = s3
+        .upload_object_with_progress(&object_uuid, &temp_path, move |bytes_uploaded, _| {
+            let _ = app_progress.emit(
+                "upload:progress",
+                UploadProgressEvent {
+                    op_id: op_id_progress.clone(),
+                    bytes_done: file_size + bytes_uploaded,
+                    bytes_total: total_actual,
+                    phase: "Uploading".into(),
+                    phase_done: bytes_uploaded,
+                    phase_total: encrypted_size,
+                },
+            );
+        })
+        .await;
+    let _ = std::fs::remove_file(&temp_path);
+    upload_result?;
+
+    let db = app.state::<DbState>();
+    let conn = db.conn()?;
+    let entry_id = db::insert_backup_entry(
+        &conn,
+        profile.id,
+        &object_uuid,
+        &encrypt_result.original_md5,
+        &encrypt_result.encrypted_md5,
+        encrypt_result.file_size as i64,
+    )?;
+
+    let metadata = std::fs::metadata(Path::new(file_path))?;
+    let mtime = metadata.modified().ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    let size = metadata.len() as i64;
+    db::insert_local_file(&conn, entry_id, &stored_path, mtime, Some(size))?;
+
+    let _ = app.emit(
+        "backup:progress",
+        BackupProgressEvent {
+            op_id: op_id.to_string(),
+            processed: 1,
+            total: 1,
+            uploaded: 1,
+            deduped: 0,
+            skipped: 0,
+            failed: 0,
+            current_file: name,
+        },
+    );
+
+    Ok("1 uploaded".to_string())
+}
 
 async fn run_backup_directory(
     app: &AppHandle,
@@ -457,6 +660,8 @@ async fn run_backup_directory(
         OpPendingFilesEvent { op_id: op_id.to_string(), files: pending_names },
     );
 
+    let app_fp = app.clone();
+    let op_id_fp = op_id.to_string();
     let db = app.state::<DbState>();
     let summary = backup::backup_directory(
         &db,
@@ -482,6 +687,19 @@ async fn run_backup_directory(
                     skipped: s.skipped,
                     failed: s.failed,
                     current_file: current_file.to_string(),
+                },
+            );
+        },
+        move |bytes_done, bytes_total, phase, phase_done, phase_total| {
+            let _ = app_fp.emit(
+                "upload:progress",
+                UploadProgressEvent {
+                    op_id: op_id_fp.clone(),
+                    bytes_done,
+                    bytes_total,
+                    phase: phase.to_string(),
+                    phase_done,
+                    phase_total,
                 },
             );
         },
@@ -599,13 +817,64 @@ async fn run_restore_files(
         }
 
         let temp_enc = crypto::generate_temp_path(&temp_dir);
-        if s3.download_object(&entry.object_uuid, &temp_enc).await.is_err() {
+        let enc_size = entry.file_size as u64;
+
+        let _ = app.emit(
+            "upload:progress",
+            UploadProgressEvent {
+                op_id: op_id.to_string(),
+                bytes_done: 0,
+                bytes_total: enc_size,
+                phase: "Downloading".into(),
+                phase_done: 0,
+                phase_total: enc_size,
+            },
+        );
+
+        let app_dl = app.clone();
+        let op_id_dl = op_id.to_string();
+        if s3
+            .download_object_with_progress(&entry.object_uuid, &temp_enc, move |done, total| {
+                let _ = app_dl.emit(
+                    "upload:progress",
+                    UploadProgressEvent {
+                        op_id: op_id_dl.clone(),
+                        bytes_done: done,
+                        bytes_total: enc_size,
+                        phase: "Downloading".into(),
+                        phase_done: done,
+                        phase_total: total,
+                    },
+                );
+            })
+            .await
+            .is_err()
+        {
             let _ = std::fs::remove_file(&temp_enc);
             failed += 1;
             continue;
         }
 
-        let result = crypto::decrypt_file(&temp_enc, &target_path, &encryption_key);
+        let app_dec = app.clone();
+        let op_id_dec = op_id.to_string();
+        let result = crypto::decrypt_file_with_progress(
+            &temp_enc,
+            &target_path,
+            &encryption_key,
+            move |done, total| {
+                let _ = app_dec.emit(
+                    "upload:progress",
+                    UploadProgressEvent {
+                        op_id: op_id_dec.clone(),
+                        bytes_done: enc_size + done,
+                        bytes_total: enc_size + total,
+                        phase: "Decrypting".into(),
+                        phase_done: done,
+                        phase_total: total,
+                    },
+                );
+            },
+        );
         let _ = std::fs::remove_file(&temp_enc);
         match result {
             Ok(()) => restored += 1,
@@ -701,9 +970,58 @@ async fn run_download_manifest(
         let target_path = save_dir.join(&file_entry.filename);
         let temp_enc = crypto::generate_temp_path(&temp_dir);
 
-        match s3.download_object(&file_entry.uuid, &temp_enc).await {
+        let _ = app.emit(
+            "upload:progress",
+            UploadProgressEvent {
+                op_id: op_id.to_string(),
+                bytes_done: 0,
+                bytes_total: 0,
+                phase: "Downloading".into(),
+                phase_done: 0,
+                phase_total: 0,
+            },
+        );
+
+        let app_dl = app.clone();
+        let op_id_dl = op_id.to_string();
+        match s3
+            .download_object_with_progress(&file_entry.uuid, &temp_enc, move |done, total| {
+                let _ = app_dl.emit(
+                    "upload:progress",
+                    UploadProgressEvent {
+                        op_id: op_id_dl.clone(),
+                        bytes_done: done,
+                        bytes_total: total,
+                        phase: "Downloading".into(),
+                        phase_done: done,
+                        phase_total: total,
+                    },
+                );
+            })
+            .await
+        {
             Ok(()) => {
-                let result = crypto::decrypt_file(&temp_enc, &target_path, &encryption_key);
+                let enc_size = std::fs::metadata(&temp_enc).map(|m| m.len()).unwrap_or(0);
+                let app_dec = app.clone();
+                let op_id_dec = op_id.to_string();
+                let result = crypto::decrypt_file_with_progress(
+                    &temp_enc,
+                    &target_path,
+                    &encryption_key,
+                    move |done, total| {
+                        let _ = app_dec.emit(
+                            "upload:progress",
+                            UploadProgressEvent {
+                                op_id: op_id_dec.clone(),
+                                bytes_done: enc_size + done,
+                                bytes_total: enc_size + total,
+                                phase: "Decrypting".into(),
+                                phase_done: done,
+                                phase_total: total,
+                            },
+                        );
+                    },
+                );
                 let _ = std::fs::remove_file(&temp_enc);
                 match result {
                     Ok(()) => restored += 1,

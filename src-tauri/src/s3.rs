@@ -29,8 +29,6 @@ where
 /// Minimum S3 multipart part size (5 MiB — S3 hard minimum for all but the last part).
 const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 
-/// Files at or above this size automatically use multipart upload.
-const LARGE_FILE_THRESHOLD: usize = 100 * 1024 * 1024; // 100 MiB
 
 /// Default chunk size used when streaming a throttled download.
 const DOWNLOAD_CHUNK_SIZE: usize = 256 * 1024; // 256 KiB
@@ -45,9 +43,14 @@ pub struct S3Client {
     client: Client,
     bucket: String,
     throttle: ThrottleState,
+    /// Multipart upload part size in bytes. Files at or above this size use multipart upload.
+    /// Each part is uploaded as a separate HTTP request; larger parts = fewer requests = faster
+    /// for big files, but each part is held in RAM temporarily (~2× this value peak).
+    part_size_bytes: usize,
 }
 
 impl S3Client {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         endpoint: &str,
         region: Option<&str>,
@@ -56,6 +59,7 @@ impl S3Client {
         secret_key: &str,
         extra_env: Option<&str>,
         throttle: ThrottleState,
+        part_size_bytes: usize,
     ) -> Result<Self, AppError> {
         // Apply extra environment variables before loading SDK config.
         // Format: comma-separated KEY=value pairs (e.g. "KEY=val,KEY2=val2").
@@ -96,6 +100,7 @@ impl S3Client {
             client,
             bucket: bucket.to_string(),
             throttle,
+            part_size_bytes: part_size_bytes.max(MULTIPART_PART_SIZE),
         })
     }
 
@@ -115,15 +120,35 @@ impl S3Client {
     /// upload.  When a rate limit is configured, multipart is used for all
     /// files so that pacing sleeps can be inserted between parts.
     pub async fn upload_object(&self, key: &str, file_path: &Path) -> Result<(), AppError> {
+        self.upload_object_impl(key, file_path, None).await
+    }
+
+    /// Like `upload_object` but calls `on_progress(bytes_done, bytes_total)` after
+    /// each uploaded part so callers can emit progress events.
+    pub async fn upload_object_with_progress(
+        &self,
+        key: &str,
+        file_path: &Path,
+        on_progress: impl Fn(u64, u64) + Send + Sync + 'static,
+    ) -> Result<(), AppError> {
+        self.upload_object_impl(key, file_path, Some(Box::new(on_progress))).await
+    }
+
+    async fn upload_object_impl(
+        &self,
+        key: &str,
+        file_path: &Path,
+        on_progress: Option<Box<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<(), AppError> {
         let upload_bps = self.throttle.get_upload_bps();
         let file_size = std::fs::metadata(file_path)
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
-        let use_multipart = upload_bps > 0 || file_size >= LARGE_FILE_THRESHOLD;
+        let use_multipart = upload_bps > 0 || file_size >= self.part_size_bytes;
 
         if use_multipart {
-            self.upload_object_multipart_throttled(key, file_path, MULTIPART_PART_SIZE, upload_bps)
+            self.upload_object_multipart_throttled(key, file_path, self.part_size_bytes, upload_bps, on_progress)
                 .await?;
         } else {
             let body = ByteStream::from_path(file_path)
@@ -138,6 +163,10 @@ impl S3Client {
                 .send()
                 .await
                 .map_err(|e| s3_err("PutObject", e))?;
+
+            if let Some(cb) = &on_progress {
+                cb(file_size as u64, file_size as u64);
+            }
         }
 
         Ok(())
@@ -146,6 +175,27 @@ impl S3Client {
     /// Download an S3 object to a local file, applying the download rate limit
     /// when one is configured.
     pub async fn download_object(&self, key: &str, file_path: &Path) -> Result<(), AppError> {
+        self.download_object_impl(key, file_path, None).await
+    }
+
+    /// Like `download_object` but calls `on_progress(bytes_done, bytes_total)` after
+    /// each downloaded chunk so callers can emit progress events.
+    /// `bytes_total` is taken from the `Content-Length` response header.
+    pub async fn download_object_with_progress(
+        &self,
+        key: &str,
+        file_path: &Path,
+        on_progress: impl Fn(u64, u64) + Send + Sync + 'static,
+    ) -> Result<(), AppError> {
+        self.download_object_impl(key, file_path, Some(Box::new(on_progress))).await
+    }
+
+    async fn download_object_impl(
+        &self,
+        key: &str,
+        file_path: &Path,
+        on_progress: Option<Box<dyn Fn(u64, u64) + Send + Sync>>,
+    ) -> Result<(), AppError> {
         let resp = self
             .client
             .get_object()
@@ -155,45 +205,50 @@ impl S3Client {
             .await
             .map_err(|e| s3_err("GetObject", e))?;
 
+        let content_length = resp.content_length().unwrap_or(0) as u64;
         let download_bps = self.throttle.get_download_bps();
 
-        if download_bps == 0 {
-            // Unthrottled: collect entire body at once
-            let data = resp
-                .body
-                .collect()
-                .await
+        // Always stream in chunks so we can report progress regardless of throttle setting.
+        use std::io::Write;
+        let mut file = std::fs::File::create(file_path).map_err(AppError::Io)?;
+        let mut body = resp.body;
+        let mut total_written: u64 = 0;
+        let mut batch_bytes: u64 = 0;
+        let mut batch_start = Instant::now();
+        let mut chunk_buf: Vec<u8> = Vec::with_capacity(DOWNLOAD_CHUNK_SIZE);
+
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk
                 .map_err(|e| AppError::S3(format!("Failed to read S3 response body: {}", e)))?;
-            std::fs::write(file_path, data.into_bytes()).map_err(AppError::Io)?;
-        } else {
-            // Throttled: stream body in chunks and pace with sleeps
-            use std::io::Write;
-            let mut file = std::fs::File::create(file_path).map_err(AppError::Io)?;
-            let mut body = resp.body;
-            let mut bytes_done: u64 = 0;
-            let mut batch_start = Instant::now();
-            let mut chunk_buf: Vec<u8> = Vec::with_capacity(DOWNLOAD_CHUNK_SIZE);
+            chunk_buf.extend_from_slice(&bytes);
 
-            while let Some(chunk) = body.next().await {
-                let bytes = chunk
-                    .map_err(|e| AppError::S3(format!("Failed to read S3 response body: {}", e)))?;
-                chunk_buf.extend_from_slice(&bytes);
+            // Flush when we've accumulated a full chunk
+            if chunk_buf.len() >= DOWNLOAD_CHUNK_SIZE {
+                let n = chunk_buf.len() as u64;
+                file.write_all(&chunk_buf).map_err(AppError::Io)?;
+                chunk_buf.clear();
+                total_written += n;
+                batch_bytes += n;
 
-                // Flush when we've accumulated a full chunk or at the end
-                if chunk_buf.len() >= DOWNLOAD_CHUNK_SIZE {
-                    let n = chunk_buf.len() as u64;
-                    file.write_all(&chunk_buf).map_err(AppError::Io)?;
-                    chunk_buf.clear();
-                    bytes_done += n;
-                    crate::throttle::enforce_rate(bytes_done, batch_start, download_bps).await;
-                    bytes_done = 0;
+                if let Some(cb) = &on_progress {
+                    cb(total_written, content_length);
+                }
+
+                if download_bps > 0 {
+                    crate::throttle::enforce_rate(batch_bytes, batch_start, download_bps).await;
+                    batch_bytes = 0;
                     batch_start = Instant::now();
                 }
             }
+        }
 
-            // Flush remainder
-            if !chunk_buf.is_empty() {
-                file.write_all(&chunk_buf).map_err(AppError::Io)?;
+        // Flush remainder
+        if !chunk_buf.is_empty() {
+            let n = chunk_buf.len() as u64;
+            file.write_all(&chunk_buf).map_err(AppError::Io)?;
+            total_written += n;
+            if let Some(cb) = &on_progress {
+                cb(total_written, content_length);
             }
         }
 
@@ -267,16 +322,16 @@ impl S3Client {
     }
 
 
-    /// Internal: multipart upload with optional per-part throttle sleep.
     async fn upload_object_multipart_throttled(
         &self,
         key: &str,
         file_path: &Path,
         part_size: usize,
         _upload_bps: u64,
+        on_progress: Option<Box<dyn Fn(u64, u64) + Send + Sync>>,
     ) -> Result<(), AppError> {
-        let file_data = std::fs::read(file_path)?;
-        let total_size = file_data.len();
+        use std::io::Read;
+        let total_size = std::fs::metadata(file_path)?.len() as usize;
 
         // S3 requires at least MULTIPART_PART_SIZE per part (except the last).
         // For tiny files fall through to a regular PutObject.
@@ -314,12 +369,19 @@ impl S3Client {
         let mut completed_parts = Vec::new();
         let mut part_number = 1i32;
         let mut offset = 0usize;
+        let mut bytes_uploaded: u64 = 0;
+
+        // Open the file once and read sequentially — avoids loading the entire
+        // encrypted blob into memory before uploading.
+        let mut file = std::fs::File::open(file_path)?;
 
         let result: Result<(), AppError> = async {
             while offset < total_size {
                 let end = std::cmp::min(offset + effective_part_size, total_size);
-                let part_data = &file_data[offset..end];
                 let part_bytes = (end - offset) as u64;
+
+                let mut part_data = vec![0u8; end - offset];
+                file.read_exact(&mut part_data)?;
 
                 let part_start = Instant::now();
 
@@ -330,7 +392,7 @@ impl S3Client {
                     .key(key)
                     .upload_id(&upload_id)
                     .part_number(part_number)
-                    .body(ByteStream::from(part_data.to_vec()))
+                    .body(ByteStream::from(part_data))
                     .send()
                     .await
                     .map_err(|e| {
@@ -350,6 +412,11 @@ impl S3Client {
                         .e_tag(etag)
                         .build(),
                 );
+
+                bytes_uploaded += part_bytes;
+                if let Some(cb) = &on_progress {
+                    cb(bytes_uploaded, total_size as u64);
+                }
 
                 // Re-read bps in case it was updated during the transfer
                 let current_bps = self.throttle.get_upload_bps();
