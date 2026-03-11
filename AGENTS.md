@@ -60,13 +60,11 @@ harpocrates/
 │   └── integration_tests.rs
 │
 ├── scripts/
-│   └── set-version.mjs     # Stamps VERSION → Cargo.toml + package.json
+│   └── set-version.mjs     # Stamps package.json version → Cargo.toml
 │
-├── .github/workflows/
-│   ├── ci.yml              # Clippy + build on push/PR
-│   └── release.yml         # Cross-platform build on v* tag push
-│
-└── VERSION                 # e.g. "0.1.0" — single source of truth for releases
+└── .github/workflows/
+    ├── ci.yml              # Clippy + build on push/PR
+    └── release.yml         # Tag + cross-platform build on push to main
 ```
 
 ---
@@ -330,15 +328,15 @@ Temporary files during encryption/decryption use the prefix `harpocrates-tmp-{uu
 
 ## Versioning
 
-`VERSION` (repo root) is the single source of truth. To release:
+`package.json` is the single source of truth for the version. To release:
 
 ```bash
-echo "0.2.0" > VERSION
+# Edit the version field in package.json, then:
 git commit -am "chore: bump version to 0.2.0"
 git tag v0.2.0 && git push origin main v0.2.0
 ```
 
-The release CI runs `node scripts/set-version.mjs` to stamp the version into `Cargo.toml` and `package.json` before building. The version appears in the app sidebar via `getVersion()`.
+The release CI runs `node scripts/set-version.mjs` to stamp the version from `package.json` into `Cargo.toml` before building. The version appears in the app sidebar via `getVersion()`.
 
 ---
 
@@ -371,7 +369,7 @@ npm run check
 | Workflow | Trigger | What it does |
 |----------|---------|-------------|
 | `ci.yml` | push/PR to `main` | Clippy (deny warnings), cargo build, npm build |
-| `release.yml` | push `v*` tag | Stamps version, builds for Linux/macOS/Windows, creates draft GitHub Release |
+| `release.yml` | push to `main` | Tags from `package.json` version, stamps version into `Cargo.toml`, builds for Linux/macOS/Windows, creates draft GitHub Release |
 
 ---
 

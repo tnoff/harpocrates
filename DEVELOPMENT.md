@@ -59,7 +59,7 @@ npm run tauri build
 # output: src-tauri/target/release/bundle/{deb,appimage,dmg,msi}/
 ```
 
-**Release build via CI:** update `VERSION`, commit, push a `v*` tag. See `AGENTS.md` for the full release flow.
+**Release build via CI:** update the version in `package.json`, commit, push a `v*` tag. See `AGENTS.md` for the full release flow.
 
 ---
 

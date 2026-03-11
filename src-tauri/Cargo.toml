@@ -1,6 +1,6 @@
 [package]
 name = "harpocrates"
-version = "0.1.0"
+version = "0.1.1"
 description = "Encrypted S3 File Manager"
 authors = ["tnorth"]
 edition = "2021"
