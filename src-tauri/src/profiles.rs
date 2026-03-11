@@ -58,6 +58,7 @@ pub fn create_profile(
     temp_directory: Option<&str>,
     import_encryption_key: Option<&str>,
     s3_key_prefix: Option<&str>,
+    upload_chunk_size_mb: Option<i64>,
 ) -> Result<CreateProfileResult, AppError> {
     // Validate mode
     if mode != "read-write" && mode != "read-only" {
@@ -84,6 +85,7 @@ pub fn create_profile(
         relative_path,
         temp_directory,
         validated_prefix.as_deref(),
+        upload_chunk_size_mb,
     )?;
 
     // Generate or import encryption key
@@ -141,6 +143,7 @@ pub fn update_profile(
     relative_path: Option<Option<&str>>,
     temp_directory: Option<Option<&str>>,
     s3_key_prefix: Option<Option<&str>>,
+    upload_chunk_size_mb: Option<Option<i64>>,
 ) -> Result<db::Profile, AppError> {
     let existing = db::get_profile_by_id(conn, id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", id)))?;
@@ -179,11 +182,14 @@ pub fn update_profile(
         Some(None) => None,
         None => existing.s3_key_prefix.clone(),
     };
+    let new_upload_chunk_size_mb = match upload_chunk_size_mb {
+        Some(v) => v,
+        None => existing.upload_chunk_size_mb,
+    };
 
-    // Delete and re-insert (simple approach for updates with unique constraints)
     conn.execute(
-        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5, extra_env=?6, relative_path=?7, temp_directory=?8, s3_key_prefix=?9 WHERE id=?10",
-        rusqlite::params![new_name, new_mode, new_endpoint, new_region, new_bucket, new_extra_env, new_relative_path, new_temp_directory, new_s3_key_prefix, id],
+        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5, extra_env=?6, relative_path=?7, temp_directory=?8, s3_key_prefix=?9, upload_chunk_size_mb=?10 WHERE id=?11",
+        rusqlite::params![new_name, new_mode, new_endpoint, new_region, new_bucket, new_extra_env, new_relative_path, new_temp_directory, new_s3_key_prefix, new_upload_chunk_size_mb, id],
     )?;
 
     // Update keychain credentials if changed
@@ -301,6 +307,7 @@ mod tests {
                 relative_path TEXT,
                 temp_directory TEXT,
                 s3_key_prefix TEXT,
+                upload_chunk_size_mb INTEGER,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(s3_endpoint, s3_bucket)
@@ -357,7 +364,7 @@ mod tests {
     fn test_get_active_profile_found() {
         let conn = setup_db();
         let id = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
         ).unwrap();
         db::set_active_profile(&conn, id).unwrap();
         let result = get_active_profile(&conn).unwrap();
@@ -369,10 +376,10 @@ mod tests {
     fn test_switch_profile() {
         let conn = setup_db();
         let id1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None,
+            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None,
         ).unwrap();
         let id2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None,
+            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, None,
         ).unwrap();
 
         let profile = switch_profile(&conn, id1).unwrap();
@@ -401,7 +408,7 @@ mod tests {
         let conn = setup_db();
         let result = create_profile(
             &conn, "test", "invalid-mode", "https://s3.test.com", None, "bucket",
-            "ak", "sk", None, None, None, None, None,
+            "ak", "sk", None, None, None, None, None, None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid profile mode"));

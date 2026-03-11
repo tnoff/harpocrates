@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::OptionalExtension;
+
 use tauri::State;
 
 use crate::backup;
@@ -38,6 +38,11 @@ fn get_temp_dir(profile: &db::Profile) -> PathBuf {
 async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
     let access_key = credentials::get_s3_access_key(&profile.name)?;
     let secret_key = credentials::get_s3_secret_key(&profile.name)?;
+    let part_size = profile
+        .upload_chunk_size_mb
+        .filter(|&mb| mb > 0)
+        .map(|mb| mb as usize * 1024 * 1024)
+        .unwrap_or(crate::crypto::DEFAULT_CHUNK_SIZE);
     S3Client::new(
         &profile.s3_endpoint,
         profile.s3_region.as_deref(),
@@ -46,6 +51,7 @@ async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
         &secret_key,
         profile.extra_env.as_deref(),
         crate::throttle::global().clone(),
+        part_size,
     )
     .await
 }
@@ -83,6 +89,7 @@ pub struct CreateProfileInput {
     pub temp_directory: Option<String>,
     pub import_encryption_key: Option<String>,
     pub s3_key_prefix: Option<String>,
+    pub upload_chunk_size_mb: Option<i64>,
 }
 
 #[tauri::command]
@@ -105,6 +112,7 @@ pub fn create_profile(
         input.temp_directory.as_deref(),
         input.import_encryption_key.as_deref(),
         input.s3_key_prefix.as_deref(),
+        input.upload_chunk_size_mb,
     )
 }
 
@@ -162,6 +170,7 @@ pub struct UpdateProfileInput {
     pub relative_path: Option<Option<String>>,
     pub temp_directory: Option<Option<String>>,
     pub s3_key_prefix: Option<Option<String>>,
+    pub upload_chunk_size_mb: Option<Option<i64>>,
 }
 
 #[tauri::command]
@@ -184,6 +193,7 @@ pub fn update_profile(
         input.relative_path.as_ref().map(|o| o.as_deref()),
         input.temp_directory.as_ref().map(|o| o.as_deref()),
         input.s3_key_prefix.as_ref().map(|o| o.as_deref()),
+        input.upload_chunk_size_mb,
     )
 }
 
@@ -221,6 +231,7 @@ pub async fn test_connection_params(
         &secret_key,
         extra_env.as_deref(),
         crate::throttle::global().clone(),
+        crate::crypto::DEFAULT_CHUNK_SIZE,
     )
     .await?;
     s3.head_bucket().await?;
@@ -252,100 +263,20 @@ pub fn get_queue(queue: State<'_, OperationQueue>) -> Result<QueueSnapshot, AppE
 // ══════════════════════════════════════════════════════
 
 #[tauri::command]
-pub async fn backup_file(db: State<'_, DbState>, file_path: String) -> Result<backup::BackupResult, AppError> {
-    // Gather everything we need from DB before async work
-    let (profile, existing_entry, encryption_key, temp_dir) = {
-        let conn = db.conn()?;
-        let profile = get_active_profile_or_err(&conn)?;
-        let encryption_key = get_profile_encryption_key(&profile)?;
-        let temp_dir = get_temp_dir(&profile);
-
-        let full_path_str = file_path.clone();
-        let stored_path = backup::strip_relative_path(&full_path_str, profile.relative_path.as_deref());
-
-        // Compute MD5 and check for dedup
-        let original_md5 = crypto::compute_file_md5(Path::new(&file_path))?;
-
-        let existing: Option<db::BackupEntry> = {
-            let mut stmt = conn.prepare(
-                "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
-                 FROM backup_entry WHERE profile_id = ?1 AND original_md5 = ?2 LIMIT 1",
-            )?;
-            stmt.query_row(rusqlite::params![profile.id, original_md5], |row: &rusqlite::Row| {
-                Ok(db::BackupEntry {
-                    id: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    object_uuid: row.get(2)?,
-                    original_md5: row.get(3)?,
-                    encrypted_md5: row.get(4)?,
-                    file_size: row.get(5)?,
-                    created_at: row.get(6)?,
-                })
-            }).optional()?
-        };
-
-        if let Some(ref entry) = existing {
-            // Dedup: just create local_file link
-            let metadata = std::fs::metadata(Path::new(&file_path))?;
-            let mtime = metadata.modified().ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64());
-            let size = metadata.len() as i64;
-            db::insert_local_file(&conn, entry.id, &stored_path, mtime, Some(size))?;
-
-            return Ok(backup::BackupResult {
-                backup_entry_id: entry.id,
-                object_uuid: entry.object_uuid.clone(),
-                original_md5: entry.original_md5.clone(),
-                encrypted_md5: entry.encrypted_md5.clone(),
-                file_size: entry.file_size as u64,
-                was_dedup: true,
-            });
-        }
-
-        (profile, existing, encryption_key, temp_dir)
-    };
-    let _ = existing_entry;
-
-    // Encrypt file
-    let temp_path = crypto::generate_temp_path(&temp_dir);
-    let encrypt_result = crypto::encrypt_file(Path::new(&file_path), &temp_path, &encryption_key)?;
-
-    let object_uuid = backup::make_s3_key(profile.s3_key_prefix.as_deref(), &uuid::Uuid::new_v4().to_string());
-
-    // Upload to S3 (async)
-    let s3 = build_s3_client(&profile).await?;
-    let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
-    let _ = std::fs::remove_file(&temp_path);
-    upload_result?;
-
-    // Write DB records (re-lock)
-    let stored_path = backup::strip_relative_path(&file_path, profile.relative_path.as_deref());
-    let conn = db.conn()?;
-    let entry_id = db::insert_backup_entry(
-        &conn,
-        profile.id,
-        &object_uuid,
-        &encrypt_result.original_md5,
-        &encrypt_result.encrypted_md5,
-        encrypt_result.file_size as i64,
-    )?;
-
-    let metadata = std::fs::metadata(Path::new(&file_path))?;
-    let mtime = metadata.modified().ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64());
-    let size = metadata.len() as i64;
-    db::insert_local_file(&conn, entry_id, &stored_path, mtime, Some(size))?;
-
-    Ok(backup::BackupResult {
-        backup_entry_id: entry_id,
-        object_uuid,
-        original_md5: encrypt_result.original_md5,
-        encrypted_md5: encrypt_result.encrypted_md5,
-        file_size: encrypt_result.file_size,
-        was_dedup: false,
-    })
+pub fn backup_file(
+    queue: State<'_, OperationQueue>,
+    file_path: String,
+) -> Result<String, AppError> {
+    let name = Path::new(&file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.clone());
+    let id = queue.enqueue(
+        format!("Backing up {}", name),
+        "backup",
+        OpParams::BackupFile { file_path },
+    );
+    Ok(id)
 }
 
 /// Enqueue a directory backup. Returns the op ID immediately.
@@ -827,6 +758,7 @@ pub struct ProfileConfigExport {
     pub relative_path: Option<String>,
     pub temp_directory: Option<String>,
     pub s3_key_prefix: Option<String>,
+    pub upload_chunk_size_mb: Option<i64>,
 }
 
 /// Export a profile's connection config (including S3 credentials) to a JSON file.
@@ -854,6 +786,7 @@ pub fn export_profile_config(
         relative_path: profile.relative_path,
         temp_directory: profile.temp_directory,
         s3_key_prefix: profile.s3_key_prefix,
+        upload_chunk_size_mb: profile.upload_chunk_size_mb,
     };
     let json = serde_json::to_string_pretty(&export)?;
     std::fs::write(&file_path, json)?;
@@ -890,6 +823,7 @@ pub fn import_profile_config(
         cfg.temp_directory.as_deref(),
         Some(&encryption_key),
         cfg.s3_key_prefix.as_deref(),
+        cfg.upload_chunk_size_mb,
     )
 }
 

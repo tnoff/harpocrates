@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import FileTable from "$lib/components/FileTable.svelte";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
@@ -51,9 +52,23 @@
     const path = await open({ multiple: false });
     if (!path) return;
     try {
-      await invoke("backup_file", { filePath: path });
-      toast.success("File backed up successfully");
-      await loadFiles();
+      const opId = await invoke<string>("backup_file", { filePath: path });
+      let unlistenComplete: () => void;
+      let unlistenFailed: () => void;
+      unlistenComplete = await listen<{ id: string; message: string }>("op:complete", (event) => {
+        if (event.payload.id === opId) {
+          unlistenComplete();
+          unlistenFailed();
+          loadFiles();
+        }
+      });
+      unlistenFailed = await listen<{ id: string; error: string }>("op:failed", (event) => {
+        if (event.payload.id === opId) {
+          unlistenComplete();
+          unlistenFailed();
+          toast.error(event.payload.error);
+        }
+      });
     } catch (e) {
       toast.error(String(e));
     }

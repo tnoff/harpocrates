@@ -322,6 +322,10 @@ fn file_has_changed(
 ///
 /// `on_progress` is called at the start of each file with the current summary
 /// snapshot and the file path string, allowing callers to emit progress events.
+///
+/// `on_file_progress(bytes_done, bytes_total, phase, phase_done, phase_total)` is called
+/// during encrypt/upload of new files only (not deduped/skipped). `phase` is one of
+/// "Checksumming", "Encrypting", "Uploading".
 #[allow(clippy::too_many_arguments)]
 pub async fn backup_directory(
     db: &crate::db::DbState,
@@ -336,6 +340,7 @@ pub async fn backup_directory(
     force_checksum: bool,
     cancel_flag: Arc<AtomicBool>,
     on_progress: impl Fn(&BackupSummary, &str) + Send,
+    on_file_progress: impl Fn(u64, u64, &'static str, u64, u64) + Send + Sync + Clone + 'static,
 ) -> Result<BackupSummary, AppError> {
     let files = scan_directory(dir_path, skip_patterns)?;
     let total_files = files.len();
@@ -408,6 +413,9 @@ pub async fn backup_directory(
             }
         }
 
+        // Signal that this file is being checksummed (before the potentially slow MD5 read).
+        on_file_progress(0, 1, "Checksumming", 0, 0);
+
         // Compute MD5
         let original_md5 = match crypto::compute_file_md5(file_path) {
             Ok(md5) => md5,
@@ -447,10 +455,20 @@ pub async fn backup_directory(
             }
             Ok(None) => {
                 let temp_path = crypto::generate_temp_path(temp_dir);
-                match crypto::encrypt_file(file_path, &temp_path, encryption_key) {
+                let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+                let total_estimate = file_size.saturating_mul(2).max(1);
+                let fp = on_file_progress.clone();
+                match crypto::encrypt_file_with_progress(file_path, &temp_path, encryption_key, move |done, _| {
+                    fp(done, total_estimate, "Encrypting", done, file_size);
+                }) {
                     Ok(encrypt_meta) => {
                         let object_uuid = make_s3_key(s3_key_prefix, &uuid::Uuid::new_v4().to_string());
-                        let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
+                        let encrypted_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(file_size);
+                        let total_actual = file_size + encrypted_size;
+                        let fp2 = on_file_progress.clone();
+                        let upload_result = s3.upload_object_with_progress(&object_uuid, &temp_path, move |uploaded, _| {
+                            fp2(file_size + uploaded, total_actual, "Uploading", uploaded, encrypted_size);
+                        }).await;
                         let _ = std::fs::remove_file(&temp_path);
 
                         match upload_result {
@@ -644,6 +662,7 @@ mod tests {
                 relative_path TEXT,
                 temp_directory TEXT,
                 s3_key_prefix TEXT,
+                upload_chunk_size_mb INTEGER,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(s3_endpoint, s3_bucket)
@@ -684,7 +703,7 @@ mod tests {
     fn test_flush_pending_writes_new_entry() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
         ).unwrap();
 
         let writes = vec![PendingWrite {
@@ -715,7 +734,7 @@ mod tests {
     fn test_flush_pending_writes_dedup() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None,
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
         ).unwrap();
         let eid = db::insert_backup_entry(&conn, pid, "existing-uuid", "md5a", "md5b", 256).unwrap();
 
@@ -764,7 +783,7 @@ mod tests {
     fn test_find_backup_by_md5_found() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None,
+            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None,
         ).unwrap();
         db::insert_backup_entry(&conn, pid, "uuid-1", "target-md5", "enc-md5", 100).unwrap();
 
@@ -777,7 +796,7 @@ mod tests {
     fn test_find_backup_by_md5_not_found() {
         let conn = setup_db();
         let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None,
+            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None,
         ).unwrap();
 
         let result = find_backup_by_md5(&conn, pid, "nonexistent-md5").unwrap();
@@ -788,10 +807,10 @@ mod tests {
     fn test_find_backup_by_md5_profile_scoped() {
         let conn = setup_db();
         let pid1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None,
+            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None,
         ).unwrap();
         let pid2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None,
+            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, None,
         ).unwrap();
 
         db::insert_backup_entry(&conn, pid1, "uuid-1", "shared-md5", "enc-md5", 100).unwrap();

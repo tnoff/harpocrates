@@ -205,7 +205,7 @@
   const blankProfile: Profile = {
     id: 0, name: "", mode: "read-write", s3_endpoint: "", s3_region: null,
     s3_bucket: "", extra_env: null, relative_path: null, temp_directory: null,
-    s3_key_prefix: null, is_active: false, created_at: "",
+    s3_key_prefix: null, upload_chunk_size_mb: null, is_active: false, created_at: "",
   };
 </script>
 

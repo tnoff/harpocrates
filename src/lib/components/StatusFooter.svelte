@@ -19,6 +19,22 @@
     expandedPending = next;
   }
 
+  function fmtBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function barPercent(op: { progress?: { current: number; total: number; fileBytesDone?: number; fileBytesTotal?: number; filePhase?: string } }): number {
+    if (!op.progress) return 0;
+    const { current, total, fileBytesDone, fileBytesTotal } = op.progress;
+    if (fileBytesDone !== undefined && fileBytesTotal && fileBytesTotal > 0) {
+      return Math.round((fileBytesDone / fileBytesTotal) * 100);
+    }
+    return total > 0 ? Math.round((current / total) * 100) : 0;
+  }
+
   const activeOp = $derived(operationsStore.list.find((o) => o.status === "running"));
   const pendingOps = $derived(operationsStore.list.filter((o) => o.status === "pending"));
   const finishedOps = $derived(
@@ -58,14 +74,24 @@
               {#if op.status === "running" && op.progress && !op.cancelling}
                 <div class="op-progress-row">
                   <div class="progress-track">
-                    <div
-                      class="progress-bar"
-                      style="width: {op.progress.total > 0
-                        ? Math.round((op.progress.current / op.progress.total) * 100)
-                        : 0}%"
-                    ></div>
+                    {#if barPercent(op) > 0}
+                      <div class="progress-bar" style="width: {barPercent(op)}%"></div>
+                    {:else}
+                      <div class="progress-bar indeterminate"></div>
+                    {/if}
                   </div>
-                  {#if op.progress.detail}
+                  {#if op.progress.filePhase}
+                    <span class="op-detail">
+                      {op.progress.filePhase}…
+                      {#if op.progress.filePhaseDone !== undefined && op.progress.filePhaseTotal}
+                        ({fmtBytes(op.progress.filePhaseDone)} / {fmtBytes(op.progress.filePhaseTotal)})
+                      {/if}
+                    </span>
+                  {:else if op.progress.fileBytesDone !== undefined && op.progress.fileBytesTotal}
+                    <span class="op-detail">
+                      {fmtBytes(op.progress.fileBytesDone)} / {fmtBytes(op.progress.fileBytesTotal)}
+                    </span>
+                  {:else if op.progress.detail}
                     <span class="op-detail">{op.progress.detail}</span>
                   {/if}
                 </div>
@@ -140,14 +166,36 @@
       <div class="header-summary">
         {#if activeOp}
           <span class="summary-icon spinning">⟳</span>
-          <span class="summary-label">
-            {activeOp.cancelling ? "Cancelling…" : activeOp.label}
-          </span>
-          {#if activeOp.progress && !activeOp.cancelling}
-            <span class="summary-progress">
-              {activeOp.progress.current}/{activeOp.progress.total}
-            </span>
-          {/if}
+          <div class="summary-center">
+            <div class="summary-top">
+              <span class="summary-label">
+                {activeOp.cancelling ? "Cancelling…" : activeOp.label}
+              </span>
+              {#if activeOp.progress && !activeOp.cancelling}
+                <span class="summary-progress">
+                  {#if activeOp.progress.filePhase}
+                    {activeOp.progress.filePhase}…
+                    {#if activeOp.progress.filePhaseDone !== undefined && activeOp.progress.filePhaseTotal}
+                      ({fmtBytes(activeOp.progress.filePhaseDone)} / {fmtBytes(activeOp.progress.filePhaseTotal)})
+                    {/if}
+                  {:else if activeOp.progress.fileBytesDone !== undefined && activeOp.progress.fileBytesTotal}
+                    {fmtBytes(activeOp.progress.fileBytesDone)} / {fmtBytes(activeOp.progress.fileBytesTotal)}
+                  {:else}
+                    {activeOp.progress.current}/{activeOp.progress.total}
+                  {/if}
+                </span>
+              {/if}
+            </div>
+            {#if activeOp.progress && !activeOp.cancelling}
+              <div class="header-progress-track">
+                {#if barPercent(activeOp) > 0}
+                  <div class="header-progress-bar" style="width: {barPercent(activeOp)}%"></div>
+                {:else}
+                  <div class="header-progress-bar indeterminate"></div>
+                {/if}
+              </div>
+            {/if}
+          </div>
         {:else if pendingOps.length > 0}
           <span class="summary-icon muted">…</span>
           <span class="summary-label muted">
@@ -204,6 +252,35 @@
     gap: 0.375rem;
     min-width: 0;
     flex: 1;
+  }
+
+  .summary-center {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .summary-top {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    min-width: 0;
+  }
+
+  .header-progress-track {
+    height: 3px;
+    background: #e2e8f0;
+    border-radius: 9999px;
+    overflow: hidden;
+  }
+
+  .header-progress-bar {
+    height: 100%;
+    background: #3b82f6;
+    border-radius: 9999px;
+    transition: width 0.3s ease;
   }
 
   .summary-icon {
@@ -378,6 +455,18 @@
     transition: width 0.2s ease;
   }
 
+  .progress-bar.indeterminate,
+  .header-progress-bar.indeterminate {
+    width: 40% !important;
+    background: #3b82f6;
+    animation: indeterminate-slide 1.4s ease-in-out infinite;
+  }
+
+  @keyframes indeterminate-slide {
+    0% { transform: translateX(-150%); }
+    100% { transform: translateX(350%); }
+  }
+
   .op-detail {
     font-size: 0.7rem;
     color: #64748b;
@@ -535,6 +624,7 @@
   /* ── Dark mode ──────────────────────────────────────────────────────────── */
   @media (prefers-color-scheme: dark) {
     .footer { background: #0f172a; border-top-color: #334155; }
+    .header-progress-track { background: #334155; }
     .summary-label.muted, .summary-progress { color: #64748b; }
     .queued-badge { background: rgb(29 78 216 / 0.2); color: #93c5fd; }
     .finished-badge { background: rgb(21 128 61 / 0.2); color: #4ade80; }

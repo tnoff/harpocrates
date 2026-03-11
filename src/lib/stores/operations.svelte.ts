@@ -5,6 +5,11 @@ export interface OperationProgress {
   current: number;
   total: number;
   detail?: string;
+  fileBytesDone?: number;
+  fileBytesTotal?: number;
+  filePhase?: string;
+  filePhaseDone?: number;
+  filePhaseTotal?: number;
 }
 
 export interface FileLogEntry {
@@ -144,6 +149,27 @@ function applyProgress(
     const { op_id, files } = event.payload;
     ops = ops.map((o) => (o.id === op_id ? { ...o, pendingFiles: files } : o));
   });
+
+  await listen<{ op_id: string; bytes_done: number; bytes_total: number; phase: string; phase_done: number; phase_total: number }>(
+    "upload:progress",
+    (event) => {
+      const { op_id, bytes_done, bytes_total, phase, phase_done, phase_total } = event.payload;
+      ops = ops.map((o) => {
+        if (o.id !== op_id) return o;
+        return {
+          ...o,
+          progress: {
+            ...(o.progress ?? { current: 0, total: 1 }),
+            fileBytesDone: bytes_done,
+            fileBytesTotal: bytes_total,
+            filePhase: phase,
+            filePhaseDone: phase_done,
+            filePhaseTotal: phase_total,
+          },
+        };
+      });
+    }
+  );
 
   await listen<{ id: string; message: string }>("op:complete", (event) => {
     const { id, message } = event.payload;
