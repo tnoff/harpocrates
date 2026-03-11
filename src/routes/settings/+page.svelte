@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { save, open } from "@tauri-apps/plugin-dialog";
+  import { homeDir } from "@tauri-apps/api/path";
   import ProfileForm from "$lib/components/ProfileForm.svelte";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { profileStore, type Profile } from "$lib/stores/profile.svelte";
@@ -30,7 +31,7 @@
   let importing = $state(false);
 
   async function startImport() {
-    const path = await open({ filters: [{ name: "Harpocrates Profile", extensions: ["json"] }] });
+    const path = await open({ filters: [{ name: "Harpocrates Profile", extensions: ["json"] }], defaultPath: await homeDir() });
     if (!path) return;
     importState = { filePath: path as string, encryptionKey: "", mode: "read-write" };
   }
@@ -191,7 +192,7 @@
   }
 
   async function importDb() {
-    const path = await open({ filters: [{ name: "JSON", extensions: ["json"] }] });
+    const path = await open({ filters: [{ name: "JSON", extensions: ["json"] }], defaultPath: await homeDir() });
     if (!path) return;
     try {
       await invoke("import_database", { filePath: path });

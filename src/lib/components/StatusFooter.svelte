@@ -26,12 +26,20 @@
     return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
-  function barPercent(op: { progress?: { current: number; total: number; fileBytesDone?: number; fileBytesTotal?: number; filePhase?: string } }): number {
+  // Per-file byte progress — used in the expanded op-row bar.
+  function fileBarPercent(op: { progress?: { current: number; total: number; fileBytesDone?: number; fileBytesTotal?: number } }): number {
     if (!op.progress) return 0;
     const { current, total, fileBytesDone, fileBytesTotal } = op.progress;
     if (fileBytesDone !== undefined && fileBytesTotal && fileBytesTotal > 0) {
       return Math.round((fileBytesDone / fileBytesTotal) * 100);
     }
+    return total > 0 ? Math.round((current / total) * 100) : 0;
+  }
+
+  // Overall file-count progress — used in the always-visible header strip bar.
+  function overallBarPercent(op: { progress?: { current: number; total: number } }): number {
+    if (!op.progress) return 0;
+    const { current, total } = op.progress;
     return total > 0 ? Math.round((current / total) * 100) : 0;
   }
 
@@ -74,8 +82,8 @@
               {#if op.status === "running" && op.progress && !op.cancelling}
                 <div class="op-progress-row">
                   <div class="progress-track">
-                    {#if barPercent(op) > 0}
-                      <div class="progress-bar" style="width: {barPercent(op)}%"></div>
+                    {#if fileBarPercent(op) > 0}
+                      <div class="progress-bar" style="width: {fileBarPercent(op)}%"></div>
                     {:else}
                       <div class="progress-bar indeterminate"></div>
                     {/if}
@@ -171,25 +179,16 @@
               <span class="summary-label">
                 {activeOp.cancelling ? "Cancelling…" : activeOp.label}
               </span>
-              {#if activeOp.progress && !activeOp.cancelling}
+              {#if activeOp.progress && !activeOp.cancelling && activeOp.progress.total > 0}
                 <span class="summary-progress">
-                  {#if activeOp.progress.filePhase}
-                    {activeOp.progress.filePhase}…
-                    {#if activeOp.progress.filePhaseDone !== undefined && activeOp.progress.filePhaseTotal}
-                      ({fmtBytes(activeOp.progress.filePhaseDone)} / {fmtBytes(activeOp.progress.filePhaseTotal)})
-                    {/if}
-                  {:else if activeOp.progress.fileBytesDone !== undefined && activeOp.progress.fileBytesTotal}
-                    {fmtBytes(activeOp.progress.fileBytesDone)} / {fmtBytes(activeOp.progress.fileBytesTotal)}
-                  {:else}
-                    {activeOp.progress.current}/{activeOp.progress.total}
-                  {/if}
+                  {activeOp.progress.current}/{activeOp.progress.total}
                 </span>
               {/if}
             </div>
             {#if activeOp.progress && !activeOp.cancelling}
               <div class="header-progress-track">
-                {#if barPercent(activeOp) > 0}
-                  <div class="header-progress-bar" style="width: {barPercent(activeOp)}%"></div>
+                {#if overallBarPercent(activeOp) > 0}
+                  <div class="header-progress-bar" style="width: {overallBarPercent(activeOp)}%"></div>
                 {:else}
                   <div class="header-progress-bar indeterminate"></div>
                 {/if}
