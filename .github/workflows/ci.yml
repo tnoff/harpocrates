@@ -63,3 +63,4 @@ jobs:
 
       - name: Build (check)
         run: cargo build --manifest-path src-tauri/Cargo.toml
+
