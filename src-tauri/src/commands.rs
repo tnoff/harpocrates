@@ -280,6 +280,7 @@ pub fn backup_file(
 }
 
 /// Enqueue a directory backup. Returns the op ID immediately.
+/// Returns an error if the same directory is already queued or active.
 #[tauri::command]
 pub fn backup_directory(
     queue: State<'_, OperationQueue>,
@@ -291,11 +292,20 @@ pub fn backup_directory(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| dir_path.clone());
+
+    if !queue.try_register_backup_dir(&dir_path) {
+        return Err(AppError::Config(format!(
+            "'{}' is already being backed up",
+            dirname
+        )));
+    }
+
     let id = queue.enqueue(
         format!("Backing up {}", dirname),
         "backup",
-        OpParams::BackupDirectory { dir_path, skip_patterns, force_checksum },
+        OpParams::BackupDirectory { dir_path: dir_path.clone(), skip_patterns, force_checksum },
     );
+    queue.bind_backup_dir_op(&id, &dir_path);
     Ok(id)
 }
 

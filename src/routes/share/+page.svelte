@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { homeDir } from "@tauri-apps/api/path";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { profileStore } from "$lib/stores/profile.svelte";
   import { selectionStore } from "$lib/stores/selection.svelte";
@@ -108,7 +109,7 @@
   }
 
   async function downloadFiles() {
-    const path = await open({ directory: true });
+    const path = await open({ directory: true, defaultPath: await homeDir() });
     if (!path || !manifestFiles) return;
 
     downloading = true;

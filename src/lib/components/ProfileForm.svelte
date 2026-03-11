@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { homeDir } from "@tauri-apps/api/path";
   import { untrack } from "svelte";
 
   interface Props {
@@ -206,7 +207,7 @@
         <input id="pf-relative-path" bind:value={relativePath} class="form-input" placeholder="/home/user/documents" />
         <button
           type="button"
-          onclick={async () => { const p = await open({ directory: true }); if (p) relativePath = p; }}
+          onclick={async () => { const p = await open({ directory: true, defaultPath: await homeDir() }); if (p) relativePath = p; }}
           class="btn-secondary"
           style="flex: none; padding-left: 0.75rem; padding-right: 0.75rem;"
         >Browse</button>
@@ -219,7 +220,7 @@
         <input id="pf-temp-dir" bind:value={tempDirectory} class="form-input" placeholder="/tmp/harpocrates" />
         <button
           type="button"
-          onclick={async () => { const p = await open({ directory: true }); if (p) tempDirectory = p; }}
+          onclick={async () => { const p = await open({ directory: true, defaultPath: await homeDir() }); if (p) tempDirectory = p; }}
           class="btn-secondary"
           style="flex: none; padding-left: 0.75rem; padding-right: 0.75rem;"
         >Browse</button>

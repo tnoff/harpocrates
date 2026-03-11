@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { homeDir } from "@tauri-apps/api/path";
   import FileTable from "$lib/components/FileTable.svelte";
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { selectionStore } from "$lib/stores/selection.svelte";
@@ -49,7 +50,7 @@
   }
 
   async function backupFile() {
-    const path = await open({ multiple: false });
+    const path = await open({ multiple: false, defaultPath: await homeDir() });
     if (!path) return;
     try {
       const opId = await invoke<string>("backup_file", { filePath: path });
@@ -88,6 +89,13 @@
 </script>
 
 <div class="page">
+  {#if !profileStore.isReadOnly}
+    <div class="table-toolbar">
+      <button onclick={backupFile} class="action-btn action-btn-primary">Backup File</button>
+      <button onclick={() => showBackupDir = true} class="action-btn action-btn-primary">Backup Directory</button>
+    </div>
+  {/if}
+
   <div class="page-header">
     <h2>Files</h2>
     {#if selectionStore.count > 0}
@@ -103,10 +111,6 @@
       oninput={(e) => handleSearch(e.currentTarget.value)}
       class="search-input"
     />
-    {#if !profileStore.isReadOnly}
-      <button onclick={backupFile} class="action-btn action-btn-primary">Backup File</button>
-      <button onclick={() => showBackupDir = true} class="action-btn action-btn-primary">Backup Directory</button>
-    {/if}
     {#if selectionStore.count > 0}
       <button onclick={() => showRestore = true} class="action-btn action-btn-secondary">Restore</button>
       <button onclick={() => showVerify = true} class="action-btn action-btn-secondary">Verify</button>
@@ -184,6 +188,11 @@
     gap: 0.75rem;
     flex-wrap: wrap;
     align-items: center;
+  }
+
+  .table-toolbar {
+    display: flex;
+    gap: 0.5rem;
   }
 
   .search-input {

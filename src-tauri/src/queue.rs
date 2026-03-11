@@ -5,7 +5,7 @@
 //! `op:failed` events to the frontend, plus per-op progress events
 //! (`backup:progress`, `restore:progress`, `scramble:progress`, `verify:progress`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -210,6 +210,12 @@ pub struct OperationQueue {
     active_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     /// App handle stored after start_worker so enqueue can emit events.
     app: Mutex<Option<AppHandle>>,
+    /// Dir paths currently in-flight (pending or active) for BackupDirectory ops.
+    /// Used to reject duplicate submissions before they reach the queue.
+    backup_dir_paths: Arc<Mutex<HashSet<String>>>,
+    /// Maps op_id → dir_path for in-flight BackupDirectory ops so that
+    /// `cancel` can free the slot immediately without waiting for the worker.
+    backup_dir_op_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl OperationQueue {
@@ -223,6 +229,27 @@ impl OperationQueue {
             active: Arc::new(Mutex::new(None)),
             active_cancel: Arc::new(Mutex::new(None)),
             app: Mutex::new(None),
+            backup_dir_paths: Arc::new(Mutex::new(HashSet::new())),
+            backup_dir_op_ids: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Atomically checks whether `dir_path` is already queued/active and, if
+    /// not, registers it. Returns `true` if registration succeeded (caller may
+    /// proceed), `false` if the path is already in-flight (caller should reject).
+    pub fn try_register_backup_dir(&self, dir_path: &str) -> bool {
+        self.backup_dir_paths.lock().unwrap().insert(dir_path.to_string())
+    }
+
+    /// Bind `op_id` to a previously-registered `dir_path` so that `cancel`
+    /// can free the slot immediately. Call right after `enqueue` returns.
+    pub fn bind_backup_dir_op(&self, op_id: &str, dir_path: &str) {
+        self.backup_dir_op_ids.lock().unwrap().insert(op_id.to_string(), dir_path.to_string());
+    }
+
+    fn unregister_backup_dir_op(&self, op_id: &str) {
+        if let Some(dir_path) = self.backup_dir_op_ids.lock().unwrap().remove(op_id) {
+            self.backup_dir_paths.lock().unwrap().remove(&dir_path);
         }
     }
 
@@ -256,18 +283,30 @@ impl OperationQueue {
     }
 
     /// Cancel a queued or active operation by ID.
-    /// - Pending: removed from queue immediately.
+    /// - Pending: removed from queue immediately; emits `queue:updated` right away.
     /// - Active: cancellation flag is set; current file finishes then op stops.
     pub fn cancel(&self, op_id: &str) {
-        {
+        let was_pending = {
             let mut pending = self.pending.lock().unwrap();
             let mut cancels = self.pending_cancels.lock().unwrap();
             if let Some(flag) = cancels.remove(op_id) {
                 flag.store(true, Ordering::Relaxed);
                 pending.retain(|e| e.id != op_id);
-                return;
+                true
+            } else {
+                false
             }
+        };
+
+        if was_pending {
+            // Free the dir-path slot immediately so the same directory can be re-queued.
+            self.unregister_backup_dir_op(op_id);
+            if let Some(app) = self.app.lock().unwrap().as_ref() {
+                emit_snapshot(app, &self.pending, &self.active);
+            }
+            return;
         }
+
         // Not pending — try active
         let active = self.active.lock().unwrap();
         if let Some(ref entry) = *active {
@@ -303,6 +342,8 @@ impl OperationQueue {
         let pending_cancels = Arc::clone(&self.pending_cancels);
         let active = Arc::clone(&self.active);
         let active_cancel_store = Arc::clone(&self.active_cancel);
+        let backup_dir_op_ids = Arc::clone(&self.backup_dir_op_ids);
+        let backup_dir_paths = Arc::clone(&self.backup_dir_paths);
 
         tauri::async_runtime::spawn(async move {
             let mut rx = rx;
@@ -313,8 +354,14 @@ impl OperationQueue {
                     pending_cancels.lock().unwrap().remove(&op.entry.id);
                 }
 
+                let op_id = op.entry.id.clone();
+
                 // Skip if cancelled while waiting in queue
                 if op.cancel.load(Ordering::Relaxed) {
+                    // Free dir-path slot (cancel() may have done this already; no-op if so).
+                    if let Some(dir) = backup_dir_op_ids.lock().unwrap().remove(&op_id) {
+                        backup_dir_paths.lock().unwrap().remove(&dir);
+                    }
                     emit_snapshot(&app, &pending, &active);
                     continue;
                 }
@@ -327,8 +374,12 @@ impl OperationQueue {
                 emit_snapshot(&app, &pending, &active);
 
                 // Execute
-                let op_id = op.entry.id.clone();
                 let result = run_op(&app, &op_id, op.params, op.cancel).await;
+
+                // Free dir-path slot for BackupDirectory ops.
+                if let Some(dir) = backup_dir_op_ids.lock().unwrap().remove(&op_id) {
+                    backup_dir_paths.lock().unwrap().remove(&dir);
+                }
 
                 // Clear active
                 {

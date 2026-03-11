@@ -45,7 +45,6 @@
             <input type="checkbox" checked={allSelected} onchange={toggleAll} />
           </th>
         {/if}
-        <th>Filename</th>
         <th>Path</th>
         <th>Size</th>
         <th>Date</th>
@@ -60,7 +59,6 @@
               <input type="checkbox" checked={selectionStore.has(file.id)} onchange={() => selectionStore.toggle(file.id)} />
             </td>
           {/if}
-          <td class="col-name">{file.filename}</td>
           <td class="col-path" title={file.local_path}>{file.local_path}</td>
           <td class="col-nowrap">{formatSize(file.file_size)}</td>
           <td class="col-nowrap">{new Date(file.created_at).toLocaleDateString()}</td>
@@ -68,7 +66,7 @@
         </tr>
       {:else}
         <tr>
-          <td colspan={selectable ? 7 : 6} class="col-empty">No files found</td>
+          <td colspan={selectable ? 5 : 4} class="col-empty">No files found</td>
         </tr>
       {/each}
     </tbody>
@@ -114,10 +112,10 @@
 
   td { padding: 0.5rem 0.75rem; }
 
-  .col-name { font-weight: 500; }
   .col-path {
-    color: #64748b;
-    max-width: 12rem;
+    font-family: monospace;
+    font-size: 0.8125rem;
+    max-width: 32rem;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -133,7 +131,7 @@
     tbody tr { border-bottom-color: #0f172a; }
     tbody tr:hover { background: rgb(30 41 59 / 0.5); }
     tbody tr.selected { background: rgb(59 130 246 / 0.08); }
-    .col-path, .col-mono { color: #94a3b8; }
+    .col-mono { color: #94a3b8; }
     .col-empty { color: #94a3b8; }
   }
 </style>

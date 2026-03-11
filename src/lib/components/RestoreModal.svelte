@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { homeDir } from "@tauri-apps/api/path";
 
   interface Props {
     selectedIds: number[];
@@ -14,7 +15,7 @@
   let error = $state("");
 
   async function pickDirectory() {
-    const path = await open({ directory: true });
+    const path = await open({ directory: true, defaultPath: await homeDir() });
     if (path) targetDir = path;
   }
 

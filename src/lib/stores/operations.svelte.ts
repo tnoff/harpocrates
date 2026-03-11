@@ -260,6 +260,10 @@ export const operationsStore = {
     const op = ops.find((o) => o.id === id);
     if (op?.status === "running") {
       ops = ops.map((o) => (o.id === id ? { ...o, cancelling: true } : o));
+    } else if (op?.status === "pending") {
+      // Optimistically drop the pending op immediately; the backend will confirm
+      // via queue:updated but this makes the cancel feel instant.
+      ops = ops.filter((o) => o.id !== id);
     }
     invoke("cancel_operation", { opId: id });
   },

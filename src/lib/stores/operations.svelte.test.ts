@@ -250,10 +250,10 @@ describe('operationsStore — actions', () => {
     expect(mockInvoke).toHaveBeenCalledWith('cancel_operation', { opId: 'op1' });
   });
 
-  it('cancel() on pending op does not set cancelling', () => {
+  it('cancel() on pending op removes it from the list immediately', () => {
     emit('queue:updated', { pending: [{ id: 'op1', label: 'Backup', op_type: 'backup' }], active: null });
     operationsStore.cancel('op1');
-    expect(operationsStore.list[0].cancelling).toBeUndefined();
+    expect(operationsStore.list.find((o) => o.id === 'op1')).toBeUndefined();
   });
 
   it('cancel() with unknown id still calls invoke and does not throw', () => {
