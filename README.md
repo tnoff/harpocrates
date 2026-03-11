@@ -24,6 +24,14 @@ Files are encrypted **before** they leave your machine. The S3 bucket contains o
 
 ---
 
+## User workflow guide
+
+See [docs/workflow.md](docs/workflow.md) for illustrated walkthroughs of the two main use cases:
+- Backing up a folder (and restoring from it)
+- Sharing files with another person
+
+---
+
 ## Security Model
 
 See [SECURITY.md](SECURITY.md) for full details. The short version:
