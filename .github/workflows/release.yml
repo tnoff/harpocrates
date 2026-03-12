@@ -16,6 +16,7 @@ jobs:
 
   build:
     needs: tag
+    if: needs.tag.outputs.tag_created == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -67,11 +68,8 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Set version from package.json
-        id: version
-        run: |
-          node scripts/set-version.mjs
-          node -e "process.stdout.write('version=' + require('./package.json').version + '\n')" >> "$GITHUB_OUTPUT"
+      - name: Sync version into Cargo.toml
+        run: node scripts/set-version.mjs
         shell: bash
 
       - name: Build Tauri app
@@ -79,8 +77,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v${{ steps.version.outputs.version }}
-          releaseName: "Harpocrates ${{ steps.version.outputs.version }}"
+          tagName: ${{ needs.tag.outputs.version }}
+          releaseName: "Harpocrates ${{ needs.tag.outputs.version }}"
           releaseBody: |
             See the assets below to download and install this version of Harpocrates.
           releaseDraft: true
