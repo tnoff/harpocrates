@@ -83,6 +83,6 @@ jobs:
           releaseName: "Harpocrates ${{ needs.tag.outputs.version }}"
           releaseBody: |
             See the assets below to download and install this version of Harpocrates.
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
