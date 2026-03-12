@@ -17,6 +17,8 @@ jobs:
   build:
     needs: tag
     if: needs.tag.outputs.tag_created == 'true'
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
