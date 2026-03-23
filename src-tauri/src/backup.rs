@@ -1,97 +1,30 @@
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
+use md5::{Digest, Md5};
 use regex::Regex;
-use rusqlite::Connection;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::crypto;
 use crate::db;
 use crate::error::AppError;
 use crate::s3::S3Client;
 
-const BATCH_SIZE: usize = 50;
-const BATCH_INTERVAL_SECS: u64 = 30;
+/// Maximum concurrent S3 PutObject requests per backup operation.
+const UPLOAD_CONCURRENCY: usize = 4;
 
-/// Construct an S3 object key from an optional prefix and a UUID.
-/// If prefix is Some and non-empty, returns `"{prefix}/{uuid}"`.
-/// Otherwise returns just `uuid`.
-pub fn make_s3_key(prefix: Option<&str>, uuid: &str) -> String {
+/// Build the S3 key for a content-addressed chunk.
+pub fn make_chunk_s3_key(prefix: Option<&str>, chunk_hash: &str) -> String {
     match prefix {
-        Some(p) if !p.is_empty() => format!("{}/{}", p, uuid),
-        _ => uuid.to_string(),
+        Some(p) if !p.is_empty() => format!("{}/c/{}", p, chunk_hash),
+        _ => format!("c/{}", chunk_hash),
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BackupResult {
-    pub backup_entry_id: i64,
-    pub object_uuid: String,
-    pub original_md5: String,
-    pub encrypted_md5: String,
-    pub file_size: u64,
-    pub was_dedup: bool,
-}
-
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct BackupSummary {
-    pub total_files: usize,
-    pub processed: usize,
-    pub skipped: usize,
-    pub uploaded: usize,
-    pub deduped: usize,
-    pub failed: usize,
-    pub failures: Vec<BackupFailure>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct BackupFailure {
-    pub path: String,
-    pub error: String,
-}
-
-/// Pending database write for batching
-struct PendingWrite {
-    profile_id: i64,
-    object_uuid: String,
-    original_md5: String,
-    encrypted_md5: String,
-    file_size: i64,
-    local_path: String,
-    cached_mtime: Option<f64>,
-    cached_size: Option<i64>,
-    is_new_entry: bool, // true = new backup_entry + local_file, false = dedup (local_file only, linked to existing)
-    existing_entry_id: Option<i64>, // for dedup case
-}
-
-/// Flush pending writes to the database in a transaction
-fn flush_pending_writes(conn: &Connection, writes: &[PendingWrite]) -> Result<(), AppError> {
-    if writes.is_empty() {
-        return Ok(());
-    }
-    let tx = conn.unchecked_transaction()?;
-    for w in writes {
-        if w.is_new_entry {
-            let entry_id = db::insert_backup_entry(
-                &tx,
-                w.profile_id,
-                &w.object_uuid,
-                &w.original_md5,
-                &w.encrypted_md5,
-                w.file_size,
-            )?;
-            db::insert_local_file(&tx, entry_id, &w.local_path, w.cached_mtime, w.cached_size)?;
-        } else if let Some(entry_id) = w.existing_entry_id {
-            // Dedup: just link local_file to existing backup_entry
-            db::insert_local_file(&tx, entry_id, &w.local_path, w.cached_mtime, w.cached_size)?;
-        }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-/// Strip the relative_path prefix from a full path to get a relative path for storage
+/// Strip the relative_path prefix from a full path to get a path for storage.
 pub fn strip_relative_path(full_path: &str, relative_path: Option<&str>) -> String {
     match relative_path {
         Some(prefix) => {
@@ -106,7 +39,7 @@ pub fn strip_relative_path(full_path: &str, relative_path: Option<&str>) -> Stri
     }
 }
 
-/// Expand a stored relative path back to a full path using relative_path prefix
+/// Expand a stored path back to a full path using relative_path prefix.
 pub fn expand_relative_path(stored_path: &str, relative_path: Option<&str>) -> PathBuf {
     match relative_path {
         Some(prefix) => {
@@ -117,126 +50,27 @@ pub fn expand_relative_path(stored_path: &str, relative_path: Option<&str>) -> P
     }
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
-pub async fn backup_single_file(
-    conn: &Connection,
-    s3: &S3Client,
-    profile_id: i64,
-    file_path: &Path,
-    encryption_key: &str,
-    s3_key_prefix: Option<&str>,
-    relative_path: Option<&str>,
-    temp_dir: &Path,
-) -> Result<BackupResult, AppError> {
-    let full_path_str = file_path.to_string_lossy().to_string();
-    let stored_path = strip_relative_path(&full_path_str, relative_path);
-
-    // Compute MD5 of original file
-    let original_md5 = crypto::compute_file_md5(file_path)?;
-
-    // Check for dedup: existing backup_entry with same original_md5 in this profile
-    let existing = find_backup_by_md5(conn, profile_id, &original_md5)?;
-
-    if let Some(entry) = existing {
-        // Dedup: just create local_file link
-        let metadata = std::fs::metadata(file_path)?;
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64());
-        let size = metadata.len() as i64;
-
-        db::insert_local_file(conn, entry.id, &stored_path, mtime, Some(size))?;
-
-        return Ok(BackupResult {
-            backup_entry_id: entry.id,
-            object_uuid: entry.object_uuid,
-            original_md5: entry.original_md5,
-            encrypted_md5: entry.encrypted_md5,
-            file_size: entry.file_size as u64,
-            was_dedup: true,
-        });
-    }
-
-    // Encrypt file to temp location
-    let temp_path = crypto::generate_temp_path(temp_dir);
-    let encrypt_result = crypto::encrypt_file(file_path, &temp_path, encryption_key)?;
-
-    // Generate UUID for S3 object
-    let object_uuid = make_s3_key(s3_key_prefix, &uuid::Uuid::new_v4().to_string());
-
-    // Upload to S3 (multipart is handled automatically for large files)
-    let upload_result = s3.upload_object(&object_uuid, &temp_path).await;
-
-    // Clean up temp file
-    let _ = std::fs::remove_file(&temp_path);
-
-    upload_result?;
-
-    // Insert backup_entry and local_file
-    let entry_id = db::insert_backup_entry(
-        conn,
-        profile_id,
-        &object_uuid,
-        &encrypt_result.original_md5,
-        &encrypt_result.encrypted_md5,
-        encrypt_result.file_size as i64,
-    )?;
-
-    let metadata = std::fs::metadata(file_path)?;
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64());
-    let size = metadata.len() as i64;
-
-    db::insert_local_file(conn, entry_id, &stored_path, mtime, Some(size))?;
-
-    Ok(BackupResult {
-        backup_entry_id: entry_id,
-        object_uuid,
-        original_md5: encrypt_result.original_md5,
-        encrypted_md5: encrypt_result.encrypted_md5,
-        file_size: encrypt_result.file_size,
-        was_dedup: false,
-    })
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BackupSummary {
+    pub total_files: usize,
+    pub processed: usize,
+    pub skipped: usize,
+    pub uploaded: usize,
+    pub deduped: usize,
+    pub failed: usize,
+    pub chunks_uploaded: usize,
+    pub chunks_deduped: usize,
+    pub failures: Vec<BackupFailure>,
 }
 
-/// Find an existing backup_entry by MD5 for deduplication
-fn find_backup_by_md5(
-    conn: &Connection,
-    profile_id: i64,
-    md5: &str,
-) -> Result<Option<db::BackupEntry>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
-         FROM backup_entry WHERE profile_id = ?1 AND original_md5 = ?2 LIMIT 1",
-    )?;
-    let entry = stmt
-        .query_row(rusqlite::params![profile_id, md5], |row| {
-            Ok(db::BackupEntry {
-                id: row.get(0)?,
-                profile_id: row.get(1)?,
-                object_uuid: row.get(2)?,
-                original_md5: row.get(3)?,
-                encrypted_md5: row.get(4)?,
-                file_size: row.get(5)?,
-                created_at: row.get(6)?,
-            })
-        })
-        .optional()?;
-    Ok(entry)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupFailure {
+    pub path: String,
+    pub error: String,
 }
 
-use rusqlite::OptionalExtension;
-
-/// Scan a directory and return all file paths (skipping symlinks and matching skip patterns)
-pub fn scan_directory(
-    dir: &Path,
-    skip_patterns: &[Regex],
-) -> Result<Vec<PathBuf>, AppError> {
+/// Scan a directory recursively, returning all file paths (skipping symlinks and skip patterns).
+pub fn scan_directory(dir: &Path, skip_patterns: &[Regex]) -> Result<Vec<PathBuf>, AppError> {
     let mut files = Vec::new();
     scan_directory_recursive(dir, skip_patterns, &mut files)?;
     Ok(files)
@@ -255,18 +89,14 @@ fn scan_directory_recursive(
             Ok(m) => m,
             Err(_) => continue,
         };
-
-        // Skip symlinks
         if metadata.file_type().is_symlink() {
             continue;
         }
-
         if metadata.is_dir() {
             scan_directory_recursive(&path, skip_patterns, files)?;
         } else if metadata.is_file() {
             let path_str = path.to_string_lossy();
-            let should_skip = skip_patterns.iter().any(|p| p.is_match(&path_str));
-            if !should_skip {
+            if !skip_patterns.iter().any(|p| p.is_match(&path_str)) {
                 files.push(path);
             }
         }
@@ -274,74 +104,215 @@ fn scan_directory_recursive(
     Ok(())
 }
 
-/// Check if a file has changed based on cached mtime and size
-fn file_has_changed(
-    conn: &Connection,
+// ── Chunk pipeline ─────────────────────────────────────────────────────────────
+
+/// Outcome of backing up one file.
+pub enum FileOutcome {
+    /// mtime + size cache hit — no work done.
+    Skipped,
+    /// file_entry already exists for this MD5 — only `local_file` was upserted.
+    Deduped,
+    /// New file_entry created; carries per-file chunk counts.
+    Uploaded { chunks_uploaded: usize, chunks_deduped: usize },
+}
+
+/// A chunk that was freshly uploaded to S3 and needs a DB record inserted.
+struct UploadedChunk {
+    chunk_index: usize,
+    chunk_hash: String,
+    s3_key: String,
+    encrypted_size: i64,
+}
+
+/// Process a single file through the chunk pipeline.
+///
+/// Reads the file in fixed-size chunks, computing a rolling MD5 and a per-chunk
+/// HMAC.  Chunks not already in the DB are encrypted and uploaded concurrently
+/// (bounded to `UPLOAD_CONCURRENCY` in-flight PutObject requests).  All DB
+/// writes happen in a single transaction *after* every upload succeeds, so the
+/// DB is always consistent with S3.
+#[allow(clippy::too_many_arguments)]
+pub async fn backup_file(
+    db_state: &crate::db::DbState,
+    s3: &S3Client,
     profile_id: i64,
+    file_path: &Path,
     stored_path: &str,
-    current_mtime: Option<f64>,
-    current_size: Option<i64>,
-) -> Result<(bool, Option<i64>), AppError> {
-    // Find local_file entry by path, joined with backup_entry for profile scope
-    let mut stmt = conn.prepare(
-        "SELECT lf.cached_mtime, lf.cached_size, lf.backup_entry_id
-         FROM local_file lf
-         JOIN backup_entry be ON lf.backup_entry_id = be.id
-         WHERE be.profile_id = ?1 AND lf.local_path = ?2
-         LIMIT 1",
-    )?;
+    key_bytes: &[u8; 32],
+    s3_key_prefix: Option<&str>,
+    chunk_size: usize,
+) -> Result<FileOutcome, AppError> {
+    // ── Change detection (fast path) ──────────────────────────────────────────
+    let metadata = std::fs::metadata(file_path)?;
+    let current_mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+    let current_size = metadata.len() as i64;
 
-    let result = stmt
-        .query_row(rusqlite::params![profile_id, stored_path], |row| {
-            let cached_mtime: Option<f64> = row.get(0)?;
-            let cached_size: Option<i64> = row.get(1)?;
-            let entry_id: i64 = row.get(2)?;
-            Ok((cached_mtime, cached_size, entry_id))
-        })
-        .optional()?;
-
-    match result {
-        Some((cached_mtime, cached_size, entry_id)) => {
-            let mtime_match = match (cached_mtime, current_mtime) {
+    {
+        let conn = db_state.conn()?;
+        if let Some(lf) = db::get_local_file_by_path(&conn, stored_path)? {
+            let mtime_ok = match (lf.cached_mtime, current_mtime) {
                 (Some(c), Some(n)) => (c - n).abs() < 0.001,
                 _ => false,
             };
-            let size_match = cached_size == current_size;
-
-            if mtime_match && size_match {
-                Ok((false, Some(entry_id))) // unchanged
-            } else {
-                Ok((true, Some(entry_id))) // changed
+            if mtime_ok && lf.cached_size == Some(current_size) {
+                return Ok(FileOutcome::Skipped);
             }
         }
-        None => Ok((true, None)), // new file
     }
+
+    // ── Read file in chunks ────────────────────────────────────────────────────
+    // Use BufReader + take(chunk_size) to always get deterministic chunk boundaries:
+    // every chunk is exactly chunk_size bytes except possibly the last one.
+    let file = std::fs::File::open(file_path)?;
+    let mut reader = BufReader::new(file);
+
+    let mut rolling_md5 = Md5::new();
+    let semaphore = Arc::new(Semaphore::new(UPLOAD_CONCURRENCY));
+    let mut join_set: JoinSet<Result<UploadedChunk, AppError>> = JoinSet::new();
+    let mut existing_chunks: Vec<(usize, i64)> = Vec::new(); // (chunk_index, chunk_id)
+    let mut chunk_index: usize = 0;
+    let mut total_size: i64 = 0;
+
+    loop {
+        let mut chunk_buf = Vec::with_capacity(chunk_size);
+        let n = reader.by_ref().take(chunk_size as u64).read_to_end(&mut chunk_buf)?;
+        if n == 0 {
+            break;
+        }
+        rolling_md5.update(&chunk_buf);
+        total_size += n as i64;
+
+        let chunk_hash = crypto::compute_chunk_hmac(key_bytes, &chunk_buf);
+
+        let existing_id = {
+            let conn = db_state.conn()?;
+            db::get_chunk_id_by_hash(&conn, profile_id, &chunk_hash)?
+        };
+
+        if let Some(id) = existing_id {
+            existing_chunks.push((chunk_index, id));
+        } else {
+            // Acquiring the permit here provides backpressure: the read loop
+            // stalls when UPLOAD_CONCURRENCY uploads are already in-flight.
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| AppError::InvalidData("Upload semaphore was closed".into()))?;
+
+            let encrypted = crypto::encrypt_chunk(key_bytes, &chunk_buf)?;
+            let enc_size = encrypted.len() as i64;
+            let s3_key = make_chunk_s3_key(s3_key_prefix, &chunk_hash);
+            let s3_clone = s3.clone();
+            let s3_key_clone = s3_key.clone();
+            let hash_clone = chunk_hash.clone();
+            let idx = chunk_index;
+
+            join_set.spawn(async move {
+                let _permit = permit; // released when this task completes
+                s3_clone.upload_chunk(&s3_key_clone, encrypted).await?;
+                Ok(UploadedChunk {
+                    chunk_index: idx,
+                    chunk_hash: hash_clone,
+                    s3_key: s3_key_clone,
+                    encrypted_size: enc_size,
+                })
+            });
+        }
+
+        chunk_index += 1;
+    }
+
+    let total_chunks = chunk_index;
+
+    // ── Collect upload results ─────────────────────────────────────────────────
+    let mut uploaded_chunks: Vec<UploadedChunk> = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(uc)) => uploaded_chunks.push(uc),
+            Ok(Err(e)) => {
+                join_set.abort_all();
+                return Err(e);
+            }
+            Err(join_err) => {
+                join_set.abort_all();
+                return Err(AppError::InvalidData(format!(
+                    "Upload task panicked: {}",
+                    join_err
+                )));
+            }
+        }
+    }
+
+    let original_md5 = hex::encode(rolling_md5.finalize());
+    let chunks_uploaded = uploaded_chunks.len();
+    let chunks_deduped = existing_chunks.len();
+
+    // ── DB writes in one transaction ───────────────────────────────────────────
+    {
+        let conn = db_state.conn()?;
+        let tx = conn.unchecked_transaction()?;
+
+        // Whole-file dedup: if file_entry with this MD5 already exists, only link local path.
+        if let Some(entry) = db::get_file_entry_by_md5(&tx, profile_id, &original_md5)? {
+            db::upsert_local_file(&tx, entry.id, stored_path, current_mtime, Some(current_size))?;
+            tx.commit()?;
+            return Ok(FileOutcome::Deduped);
+        }
+
+        // Insert chunk records for newly uploaded chunks
+        let mut all_chunks: Vec<(usize, i64)> = existing_chunks;
+
+        for uc in &uploaded_chunks {
+            let chunk_id =
+                db::insert_chunk(&tx, profile_id, &uc.chunk_hash, &uc.s3_key, uc.encrypted_size)?;
+            all_chunks.push((uc.chunk_index, chunk_id));
+        }
+
+        // Insert file_entry
+        let file_entry_id =
+            db::insert_file_entry(&tx, profile_id, &original_md5, total_size, total_chunks as i64)?;
+
+        // Insert file_chunk rows in index order
+        all_chunks.sort_by_key(|(idx, _)| *idx);
+        for (idx, chunk_id) in &all_chunks {
+            db::insert_file_chunk(&tx, file_entry_id, *idx as i64, *chunk_id)?;
+        }
+
+        db::upsert_local_file(&tx, file_entry_id, stored_path, current_mtime, Some(current_size))?;
+        tx.commit()?;
+    }
+
+    Ok(FileOutcome::Uploaded { chunks_uploaded, chunks_deduped })
 }
 
-/// Backup a directory with change detection, dedup, and batching.
+// ── Directory backup ──────────────────────────────────────────────────────────
+
+/// Backup a directory using content-addressed chunk storage.
 ///
-/// `on_progress` is called at the start of each file with the current summary
-/// snapshot and the file path string, allowing callers to emit progress events.
-///
-/// `on_file_progress(bytes_done, bytes_total, phase, phase_done, phase_total)` is called
-/// during encrypt/upload of new files only (not deduped/skipped). `phase` is one of
-/// "Checksumming", "Encrypting", "Uploading".
+/// - `key_hex`: 64-char hex-encoded 32-byte encryption key
+/// - `chunk_size`: bytes per chunk (from profile `chunk_size_bytes`)
+/// - `on_progress(summary, file_path)`: called before processing each file
 #[allow(clippy::too_many_arguments)]
 pub async fn backup_directory(
     db: &crate::db::DbState,
     s3: &S3Client,
     profile_id: i64,
     dir_path: &Path,
-    encryption_key: &str,
+    key_hex: &str,
     s3_key_prefix: Option<&str>,
     relative_path: Option<&str>,
-    temp_dir: &Path,
+    chunk_size: usize,
     skip_patterns: &[Regex],
     force_checksum: bool,
     cancel_flag: Arc<AtomicBool>,
     on_progress: impl Fn(&BackupSummary, &str) + Send,
-    on_file_progress: impl Fn(u64, u64, &'static str, u64, u64) + Send + Sync + Clone + 'static,
 ) -> Result<BackupSummary, AppError> {
+    let key_bytes = crypto::decode_encryption_key(key_hex)?;
     let files = scan_directory(dir_path, skip_patterns)?;
     let total_files = files.len();
 
@@ -349,202 +320,70 @@ pub async fn backup_directory(
         total_files,
         ..Default::default()
     };
-    let mut pending_writes: Vec<PendingWrite> = Vec::new();
-    let mut last_flush = Instant::now();
 
     for file_path in &files {
-        // Check cancellation
         if cancel_flag.load(Ordering::Relaxed) {
-            let conn = db.conn()?;
-            flush_pending_writes(&conn, &pending_writes)?;
-            pending_writes.clear();
             break;
         }
 
         let full_path_str = file_path.to_string_lossy().to_string();
         let stored_path = strip_relative_path(&full_path_str, relative_path);
 
-        // Emit progress before processing this file
         on_progress(&summary, &full_path_str);
 
-        // Get file metadata
-        let metadata = match std::fs::metadata(file_path) {
-            Ok(m) => m,
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(BackupFailure {
-                    path: full_path_str,
-                    error: e.to_string(),
-                });
-                summary.processed += 1;
-                continue;
-            }
-        };
-
-        let current_mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs_f64());
-        let current_size = Some(metadata.len() as i64);
-
-        // Change detection (fast path)
-        if !force_checksum {
-            let change_result = {
-                let conn = db.conn()?;
-                file_has_changed(&conn, profile_id, &stored_path, current_mtime, current_size)
-            };
-            match change_result {
-                Ok((false, Some(_entry_id))) => {
-                    summary.skipped += 1;
-                    summary.processed += 1;
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    summary.failed += 1;
-                    summary.failures.push(BackupFailure {
-                        path: full_path_str,
-                        error: e.to_string(),
-                    });
-                    summary.processed += 1;
-                    continue;
-                }
-            }
-        }
-
-        // Signal that this file is being checksummed (before the potentially slow MD5 read).
-        on_file_progress(0, 1, "Checksumming", 0, 0);
-
-        // Compute MD5
-        let original_md5 = match crypto::compute_file_md5(file_path) {
-            Ok(md5) => md5,
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(BackupFailure {
-                    path: full_path_str,
-                    error: e.to_string(),
-                });
-                summary.processed += 1;
-                continue;
-            }
-        };
-
-        // Check dedup (short DB lock)
-        let dedup_result = {
+        // force_checksum bypasses mtime/size cache by clearing the stored entry
+        if force_checksum {
             let conn = db.conn()?;
-            find_backup_by_md5(&conn, profile_id, &original_md5)
-        };
-
-        match dedup_result {
-            Ok(Some(existing)) => {
-                pending_writes.push(PendingWrite {
-                    profile_id,
-                    object_uuid: existing.object_uuid,
-                    original_md5: existing.original_md5,
-                    encrypted_md5: existing.encrypted_md5,
-                    file_size: existing.file_size,
-                    local_path: stored_path,
-                    cached_mtime: current_mtime,
-                    cached_size: current_size,
-                    is_new_entry: false,
-                    existing_entry_id: Some(existing.id),
-                });
-                summary.deduped += 1;
-                summary.processed += 1;
-            }
-            Ok(None) => {
-                let temp_path = crypto::generate_temp_path(temp_dir);
-                let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
-                let total_estimate = file_size.saturating_mul(2).max(1);
-                let fp = on_file_progress.clone();
-                match crypto::encrypt_file_with_progress(file_path, &temp_path, encryption_key, move |done, _| {
-                    fp(done, total_estimate, "Encrypting", done, file_size);
-                }) {
-                    Ok(encrypt_meta) => {
-                        let object_uuid = make_s3_key(s3_key_prefix, &uuid::Uuid::new_v4().to_string());
-                        let encrypted_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(file_size);
-                        let total_actual = file_size + encrypted_size;
-                        let fp2 = on_file_progress.clone();
-                        let upload_result = s3.upload_object_with_progress(&object_uuid, &temp_path, move |uploaded, _| {
-                            fp2(file_size + uploaded, total_actual, "Uploading", uploaded, encrypted_size);
-                        }).await;
-                        let _ = std::fs::remove_file(&temp_path);
-
-                        match upload_result {
-                            Ok(()) => {
-                                pending_writes.push(PendingWrite {
-                                    profile_id,
-                                    object_uuid,
-                                    original_md5: encrypt_meta.original_md5,
-                                    encrypted_md5: encrypt_meta.encrypted_md5,
-                                    file_size: encrypt_meta.file_size as i64,
-                                    local_path: stored_path,
-                                    cached_mtime: current_mtime,
-                                    cached_size: current_size,
-                                    is_new_entry: true,
-                                    existing_entry_id: None,
-                                });
-                                summary.uploaded += 1;
-                                summary.processed += 1;
-                            }
-                            Err(e) => {
-                                summary.failed += 1;
-                                summary.failures.push(BackupFailure {
-                                    path: full_path_str,
-                                    error: e.to_string(),
-                                });
-                                summary.processed += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&temp_path);
-                        summary.failed += 1;
-                        summary.failures.push(BackupFailure {
-                            path: full_path_str,
-                            error: e.to_string(),
-                        });
-                        summary.processed += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                summary.failed += 1;
-                summary.failures.push(BackupFailure {
-                    path: full_path_str,
-                    error: e.to_string(),
-                });
-                summary.processed += 1;
+            if let Some(lf) = db::get_local_file_by_path(&conn, &stored_path)? {
+                db::delete_local_file(&conn, lf.id)?;
             }
         }
 
-        // Batch flush (short DB lock)
-        if pending_writes.len() >= BATCH_SIZE
-            || last_flush.elapsed().as_secs() >= BATCH_INTERVAL_SECS
+        match backup_file(
+            db,
+            s3,
+            profile_id,
+            file_path,
+            &stored_path,
+            &key_bytes,
+            s3_key_prefix,
+            chunk_size,
+        )
+        .await
         {
-            let conn = db.conn()?;
-            flush_pending_writes(&conn, &pending_writes)?;
-            pending_writes.clear();
-            last_flush = Instant::now();
+            Ok(FileOutcome::Skipped) => {
+                summary.skipped += 1;
+            }
+            Ok(FileOutcome::Deduped) => {
+                summary.deduped += 1;
+            }
+            Ok(FileOutcome::Uploaded { chunks_uploaded, chunks_deduped }) => {
+                summary.uploaded += 1;
+                summary.chunks_uploaded += chunks_uploaded;
+                summary.chunks_deduped += chunks_deduped;
+            }
+            Err(e) => {
+                summary.failed += 1;
+                summary.failures.push(BackupFailure {
+                    path: full_path_str,
+                    error: e.to_string(),
+                });
+            }
         }
-    }
-
-    // Final flush
-    {
-        let conn = db.conn()?;
-        flush_pending_writes(&conn, &pending_writes)?;
+        summary.processed += 1;
     }
 
     Ok(summary)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    // ── strip_relative_path tests ──
+    // ── strip_relative_path ────────────────────────────────────────────────────
 
     #[test]
     fn test_strip_relative_path_with_prefix() {
@@ -554,7 +393,8 @@ mod tests {
 
     #[test]
     fn test_strip_relative_path_with_trailing_slash() {
-        let result = strip_relative_path("/home/user/documents/file.txt", Some("/home/user/"));
+        let result =
+            strip_relative_path("/home/user/documents/file.txt", Some("/home/user/"));
         assert_eq!(result, "documents/file.txt");
     }
 
@@ -576,7 +416,7 @@ mod tests {
         assert_eq!(result, "");
     }
 
-    // ── expand_relative_path tests ──
+    // ── expand_relative_path ───────────────────────────────────────────────────
 
     #[test]
     fn test_expand_relative_path_with_prefix() {
@@ -596,7 +436,35 @@ mod tests {
         assert_eq!(result, PathBuf::from("/absolute/path/file.txt"));
     }
 
-    // ── scan_directory tests ──
+    // ── make_chunk_s3_key ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_make_chunk_s3_key_no_prefix() {
+        assert_eq!(make_chunk_s3_key(None, "abc123"), "c/abc123");
+    }
+
+    #[test]
+    fn test_make_chunk_s3_key_empty_prefix() {
+        assert_eq!(make_chunk_s3_key(Some(""), "abc123"), "c/abc123");
+    }
+
+    #[test]
+    fn test_make_chunk_s3_key_with_prefix() {
+        assert_eq!(
+            make_chunk_s3_key(Some("team-alpha"), "abc123"),
+            "team-alpha/c/abc123"
+        );
+    }
+
+    #[test]
+    fn test_make_chunk_s3_key_nested_prefix() {
+        assert_eq!(
+            make_chunk_s3_key(Some("org/team"), "abc123"),
+            "org/team/c/abc123"
+        );
+    }
+
+    // ── scan_directory ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_scan_directory_empty() {
@@ -644,201 +512,19 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── flush_pending_writes tests ──
-
-    fn setup_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS profile (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'read-write',
-                s3_endpoint TEXT NOT NULL,
-                s3_region TEXT,
-                s3_bucket TEXT NOT NULL,
-                extra_env TEXT,
-                relative_path TEXT,
-                temp_directory TEXT,
-                s3_key_prefix TEXT,
-                upload_chunk_size_mb INTEGER,
-                is_active BOOLEAN NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(s3_endpoint, s3_bucket)
-            );
-            CREATE TABLE IF NOT EXISTS backup_entry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                profile_id INTEGER NOT NULL REFERENCES profile(id),
-                object_uuid TEXT NOT NULL,
-                original_md5 TEXT NOT NULL,
-                encrypted_md5 TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(profile_id, object_uuid)
-            );
-            CREATE TABLE IF NOT EXISTS local_file (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                backup_entry_id INTEGER NOT NULL REFERENCES backup_entry(id),
-                local_path TEXT NOT NULL,
-                cached_mtime REAL,
-                cached_size INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(backup_entry_id, local_path)
-            );
-            ",
-        )
-        .unwrap();
-        conn
-    }
-
-    #[test]
-    fn test_flush_pending_writes_empty() {
-        let conn = setup_db();
-        let result = flush_pending_writes(&conn, &[]);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_flush_pending_writes_new_entry() {
-        let conn = setup_db();
-        let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
-        ).unwrap();
-
-        let writes = vec![PendingWrite {
-            profile_id: pid,
-            object_uuid: "uuid-flush-1".into(),
-            original_md5: "md5orig".into(),
-            encrypted_md5: "md5enc".into(),
-            file_size: 512,
-            local_path: "docs/readme.txt".into(),
-            cached_mtime: Some(1000.0),
-            cached_size: Some(512),
-            is_new_entry: true,
-            existing_entry_id: None,
-        }];
-
-        flush_pending_writes(&conn, &writes).unwrap();
-
-        let entries = db::list_backup_entries(&conn, pid).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].object_uuid, "uuid-flush-1");
-
-        let files = db::list_local_files(&conn, entries[0].id).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].local_path, "docs/readme.txt");
-    }
-
-    #[test]
-    fn test_flush_pending_writes_dedup() {
-        let conn = setup_db();
-        let pid = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
-        ).unwrap();
-        let eid = db::insert_backup_entry(&conn, pid, "existing-uuid", "md5a", "md5b", 256).unwrap();
-
-        let writes = vec![PendingWrite {
-            profile_id: pid,
-            object_uuid: "existing-uuid".into(),
-            original_md5: "md5a".into(),
-            encrypted_md5: "md5b".into(),
-            file_size: 256,
-            local_path: "another/path.txt".into(),
-            cached_mtime: Some(2000.0),
-            cached_size: Some(256),
-            is_new_entry: false,
-            existing_entry_id: Some(eid),
-        }];
-
-        flush_pending_writes(&conn, &writes).unwrap();
-
-        // Should have linked local_file to existing backup_entry
-        let files = db::list_local_files(&conn, eid).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].local_path, "another/path.txt");
-
-        // No new backup_entry should be created
-        let entries = db::list_backup_entries(&conn, pid).unwrap();
-        assert_eq!(entries.len(), 1);
-    }
-
-    // ── BackupSummary/BackupResult struct tests ──
+    // ── BackupSummary ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_backup_summary_default() {
-        let summary = BackupSummary::default();
-        assert_eq!(summary.total_files, 0);
-        assert_eq!(summary.processed, 0);
-        assert_eq!(summary.skipped, 0);
-        assert_eq!(summary.uploaded, 0);
-        assert_eq!(summary.deduped, 0);
-        assert_eq!(summary.failed, 0);
-        assert!(summary.failures.is_empty());
-    }
-
-    // ── find_backup_by_md5 tests ──
-
-    #[test]
-    fn test_find_backup_by_md5_found() {
-        let conn = setup_db();
-        let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None,
-        ).unwrap();
-        db::insert_backup_entry(&conn, pid, "uuid-1", "target-md5", "enc-md5", 100).unwrap();
-
-        let result = find_backup_by_md5(&conn, pid, "target-md5").unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().original_md5, "target-md5");
-    }
-
-    #[test]
-    fn test_find_backup_by_md5_not_found() {
-        let conn = setup_db();
-        let pid = db::insert_profile(
-            &conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None,
-        ).unwrap();
-
-        let result = find_backup_by_md5(&conn, pid, "nonexistent-md5").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_find_backup_by_md5_profile_scoped() {
-        let conn = setup_db();
-        let pid1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None,
-        ).unwrap();
-        let pid2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, None,
-        ).unwrap();
-
-        db::insert_backup_entry(&conn, pid1, "uuid-1", "shared-md5", "enc-md5", 100).unwrap();
-
-        // Same MD5 but different profile should not match
-        let result = find_backup_by_md5(&conn, pid2, "shared-md5").unwrap();
-        assert!(result.is_none());
-    }
-
-    // ── make_s3_key tests ──
-
-    #[test]
-    fn test_make_s3_key_no_prefix() {
-        assert_eq!(make_s3_key(None, "my-uuid"), "my-uuid");
-    }
-
-    #[test]
-    fn test_make_s3_key_empty_prefix() {
-        assert_eq!(make_s3_key(Some(""), "my-uuid"), "my-uuid");
-    }
-
-    #[test]
-    fn test_make_s3_key_with_prefix() {
-        assert_eq!(make_s3_key(Some("team-alpha"), "my-uuid"), "team-alpha/my-uuid");
-    }
-
-    #[test]
-    fn test_make_s3_key_nested_prefix() {
-        assert_eq!(make_s3_key(Some("org/team"), "my-uuid"), "org/team/my-uuid");
+        let s = BackupSummary::default();
+        assert_eq!(s.total_files, 0);
+        assert_eq!(s.processed, 0);
+        assert_eq!(s.skipped, 0);
+        assert_eq!(s.uploaded, 0);
+        assert_eq!(s.deduped, 0);
+        assert_eq!(s.failed, 0);
+        assert_eq!(s.chunks_uploaded, 0);
+        assert_eq!(s.chunks_deduped, 0);
+        assert!(s.failures.is_empty());
     }
 }

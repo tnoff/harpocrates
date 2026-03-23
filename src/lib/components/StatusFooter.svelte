@@ -138,10 +138,10 @@
                 {#if expandedPending.has(op.id) && op.pendingFiles.length > 0}
                   {@const displayPending = op.pendingFiles.slice(0, 100)}
                   <div class="file-list pending-list">
-                    {#each displayPending as name, i (i)}
+                    {#each displayPending as pending, i (i)}
                       <div class="file-entry">
                         <span class="file-bullet">·</span>
-                        <span class="file-name">{name}</span>
+                        <span class="file-name">{pending.split("/").at(-1) ?? pending}</span>
                       </div>
                     {/each}
                     {#if op.pendingFiles.length > 100}

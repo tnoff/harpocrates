@@ -13,38 +13,39 @@ impl DbState {
     }
 }
 
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 pub fn init_database(path: &str) -> Result<Connection, AppError> {
     let conn = Connection::open(path)?;
-
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
     let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
-    if version < 1 {
-        create_schema(&conn)?;
-    }
-    if version < 2 {
-        migrate_v1_to_v2(&conn)?;
-    }
-    if version < 3 {
-        migrate_v2_to_v3(&conn)?;
-    }
-    if version < 4 {
-        migrate_v3_to_v4(&conn)?;
-    }
     if version < SCHEMA_VERSION {
+        migrate_to_v5(&conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
 
     Ok(conn)
 }
 
-fn create_schema(conn: &Connection) -> Result<(), AppError> {
+/// Drop all old tables and create the new v5 schema from scratch.
+fn migrate_to_v5(conn: &Connection) -> Result<(), AppError> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS profile (
+        PRAGMA foreign_keys = OFF;
+        BEGIN;
+
+        DROP TABLE IF EXISTS share_manifest_entry;
+        DROP TABLE IF EXISTS local_file;
+        DROP TABLE IF EXISTS share_manifest;
+        DROP TABLE IF EXISTS file_chunk;
+        DROP TABLE IF EXISTS file_entry;
+        DROP TABLE IF EXISTS chunk;
+        DROP TABLE IF EXISTS backup_entry;
+        DROP TABLE IF EXISTS profile;
+
+        CREATE TABLE profile (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL,
             mode TEXT NOT NULL DEFAULT 'read-write',
@@ -54,23 +55,54 @@ fn create_schema(conn: &Connection) -> Result<(), AppError> {
             extra_env TEXT,
             relative_path TEXT,
             temp_directory TEXT,
-            s3_key_prefix TEXT,\n            upload_chunk_size_mb INTEGER,
+            s3_key_prefix TEXT,
+            chunk_size_bytes INTEGER NOT NULL DEFAULT 10485760,
             is_active BOOLEAN NOT NULL DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS backup_entry (
+        -- One row per unique chunk stored in S3 (content-addressed)
+        CREATE TABLE chunk (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_id INTEGER NOT NULL REFERENCES profile(id),
-            object_uuid TEXT NOT NULL,
-            original_md5 TEXT NOT NULL,
-            encrypted_md5 TEXT NOT NULL,
-            file_size INTEGER NOT NULL,
+            chunk_hash TEXT NOT NULL,
+            s3_key TEXT NOT NULL,
+            encrypted_size INTEGER NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(profile_id, object_uuid)
+            UNIQUE(profile_id, chunk_hash)
         );
 
-        CREATE TABLE IF NOT EXISTS share_manifest (
+        -- One row per unique file content (whole-file dedup by MD5)
+        CREATE TABLE file_entry (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_id INTEGER NOT NULL REFERENCES profile(id),
+            original_md5 TEXT NOT NULL,
+            total_size INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(profile_id, original_md5)
+        );
+
+        -- Ordered chunk list for each file_entry
+        CREATE TABLE file_chunk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_entry_id INTEGER NOT NULL REFERENCES file_entry(id),
+            chunk_index INTEGER NOT NULL,
+            chunk_id INTEGER NOT NULL REFERENCES chunk(id),
+            UNIQUE(file_entry_id, chunk_index)
+        );
+
+        -- Local paths mapped to file_entries
+        CREATE TABLE local_file (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_entry_id INTEGER NOT NULL REFERENCES file_entry(id),
+            local_path TEXT NOT NULL UNIQUE,
+            cached_mtime REAL,
+            cached_size INTEGER,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE share_manifest (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_id INTEGER NOT NULL REFERENCES profile(id),
             manifest_uuid TEXT NOT NULL,
@@ -81,71 +113,17 @@ fn create_schema(conn: &Connection) -> Result<(), AppError> {
             UNIQUE(profile_id, manifest_uuid)
         );
 
-        CREATE TABLE IF NOT EXISTS share_manifest_entry (
+        CREATE TABLE share_manifest_entry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             share_manifest_id INTEGER NOT NULL REFERENCES share_manifest(id),
-            backup_entry_id INTEGER NOT NULL REFERENCES backup_entry(id),
+            file_entry_id INTEGER NOT NULL REFERENCES file_entry(id),
             filename TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS local_file (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            backup_entry_id INTEGER NOT NULL REFERENCES backup_entry(id),
-            local_path TEXT NOT NULL,
-            cached_mtime REAL,
-            cached_size INTEGER,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(backup_entry_id, local_path)
-        );
-        ",
-    )?;
-    Ok(())
-}
-
-/// Remove the UNIQUE(s3_endpoint, s3_bucket) constraint from the profile table.
-/// SQLite doesn't support DROP CONSTRAINT, so we recreate the table without it.
-fn migrate_v1_to_v2(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch(
-        "
-        PRAGMA foreign_keys = OFF;
-        BEGIN;
-
-        CREATE TABLE IF NOT EXISTS profile_v2 (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            mode TEXT NOT NULL DEFAULT 'read-write',
-            s3_endpoint TEXT NOT NULL,
-            s3_region TEXT,
-            s3_bucket TEXT NOT NULL,
-            extra_env TEXT,
-            relative_path TEXT,
-            temp_directory TEXT,
-            is_active BOOLEAN NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-
-        INSERT OR IGNORE INTO profile_v2
-            SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket,
-                   extra_env, relative_path, temp_directory, is_active, created_at
-            FROM profile;
-
-        DROP TABLE profile;
-        ALTER TABLE profile_v2 RENAME TO profile;
 
         COMMIT;
         PRAGMA foreign_keys = ON;
         ",
     )?;
-    Ok(())
-}
-
-fn migrate_v2_to_v3(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch("ALTER TABLE profile ADD COLUMN s3_key_prefix TEXT;")?;
-    Ok(())
-}
-
-fn migrate_v3_to_v4(conn: &Connection) -> Result<(), AppError> {
-    conn.execute_batch("ALTER TABLE profile ADD COLUMN upload_chunk_size_mb INTEGER;")?;
     Ok(())
 }
 
@@ -163,7 +141,7 @@ pub struct Profile {
     pub relative_path: Option<String>,
     pub temp_directory: Option<String>,
     pub s3_key_prefix: Option<String>,
-    pub upload_chunk_size_mb: Option<i64>,
+    pub chunk_size_bytes: i64,
     pub is_active: bool,
     pub created_at: String,
 }
@@ -180,19 +158,19 @@ pub fn insert_profile(
     relative_path: Option<&str>,
     temp_directory: Option<&str>,
     s3_key_prefix: Option<&str>,
-    upload_chunk_size_mb: Option<i64>,
+    chunk_size_bytes: i64,
 ) -> Result<i64, AppError> {
     conn.execute(
-        "INSERT INTO profile (name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, upload_chunk_size_mb)
+        "INSERT INTO profile (name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, chunk_size_bytes)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, upload_chunk_size_mb],
+        params![name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, chunk_size_bytes],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix, upload_chunk_size_mb
+        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix, chunk_size_bytes
          FROM profile WHERE id = ?1",
     )?;
     let profile = stmt
@@ -210,7 +188,7 @@ pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, 
                 is_active: row.get(9)?,
                 created_at: row.get(10)?,
                 s3_key_prefix: row.get(11)?,
-                upload_chunk_size_mb: row.get(12)?,
+                chunk_size_bytes: row.get(12)?,
             })
         })
         .optional()?;
@@ -219,7 +197,7 @@ pub fn get_profile_by_id(conn: &Connection, id: i64) -> Result<Option<Profile>, 
 
 pub fn list_profiles(conn: &Connection) -> Result<Vec<Profile>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix, upload_chunk_size_mb
+        "SELECT id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, is_active, created_at, s3_key_prefix, chunk_size_bytes
          FROM profile ORDER BY id",
     )?;
     let profiles = stmt
@@ -237,7 +215,7 @@ pub fn list_profiles(conn: &Connection) -> Result<Vec<Profile>, AppError> {
                 is_active: row.get(9)?,
                 created_at: row.get(10)?,
                 s3_key_prefix: row.get(11)?,
-                upload_chunk_size_mb: row.get(12)?,
+                chunk_size_bytes: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -255,87 +233,365 @@ pub fn set_active_profile(conn: &Connection, id: i64) -> Result<(), AppError> {
     Ok(())
 }
 
-// ── BackupEntry CRUD ──
+// ── Chunk CRUD ──
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct BackupEntry {
+pub struct Chunk {
     pub id: i64,
     pub profile_id: i64,
-    pub object_uuid: String,
-    pub original_md5: String,
-    pub encrypted_md5: String,
-    pub file_size: i64,
+    pub chunk_hash: String,
+    pub s3_key: String,
+    pub encrypted_size: i64,
     pub created_at: String,
 }
 
-pub fn insert_backup_entry(
+pub fn insert_chunk(
     conn: &Connection,
     profile_id: i64,
-    object_uuid: &str,
-    original_md5: &str,
-    encrypted_md5: &str,
-    file_size: i64,
+    chunk_hash: &str,
+    s3_key: &str,
+    encrypted_size: i64,
 ) -> Result<i64, AppError> {
     conn.execute(
-        "INSERT INTO backup_entry (profile_id, object_uuid, original_md5, encrypted_md5, file_size)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![profile_id, object_uuid, original_md5, encrypted_md5, file_size],
+        "INSERT INTO chunk (profile_id, chunk_hash, s3_key, encrypted_size)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![profile_id, chunk_hash, s3_key, encrypted_size],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
-pub fn get_backup_entry_by_id(conn: &Connection, id: i64) -> Result<Option<BackupEntry>, AppError> {
+pub fn get_chunk_id_by_hash(
+    conn: &Connection,
+    profile_id: i64,
+    chunk_hash: &str,
+) -> Result<Option<i64>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
-         FROM backup_entry WHERE id = ?1",
+        "SELECT id FROM chunk WHERE profile_id = ?1 AND chunk_hash = ?2",
+    )?;
+    let id = stmt
+        .query_row(params![profile_id, chunk_hash], |row| row.get(0))
+        .optional()?;
+    Ok(id)
+}
+
+pub fn get_chunk_by_id(conn: &Connection, id: i64) -> Result<Option<Chunk>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, chunk_hash, s3_key, encrypted_size, created_at
+         FROM chunk WHERE id = ?1",
+    )?;
+    let chunk = stmt
+        .query_row(params![id], |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                chunk_hash: row.get(2)?,
+                s3_key: row.get(3)?,
+                encrypted_size: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .optional()?;
+    Ok(chunk)
+}
+
+pub fn update_chunk_s3_key(conn: &Connection, id: i64, new_s3_key: &str) -> Result<(), AppError> {
+    conn.execute(
+        "UPDATE chunk SET s3_key = ?1 WHERE id = ?2",
+        params![new_s3_key, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_chunk(conn: &Connection, id: i64) -> Result<(), AppError> {
+    conn.execute("DELETE FROM chunk WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// List all chunks for a profile (used by orphan detection).
+pub fn list_chunks(conn: &Connection, profile_id: i64) -> Result<Vec<Chunk>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, chunk_hash, s3_key, encrypted_size, created_at
+         FROM chunk WHERE profile_id = ?1",
+    )?;
+    let chunks = stmt
+        .query_map(params![profile_id], |row| {
+            Ok(Chunk {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                chunk_hash: row.get(2)?,
+                s3_key: row.get(3)?,
+                encrypted_size: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(chunks)
+}
+
+// ── FileEntry CRUD ──
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FileEntry {
+    pub id: i64,
+    pub profile_id: i64,
+    pub original_md5: String,
+    pub total_size: i64,
+    pub chunk_count: i64,
+    pub created_at: String,
+}
+
+pub fn insert_file_entry(
+    conn: &Connection,
+    profile_id: i64,
+    original_md5: &str,
+    total_size: i64,
+    chunk_count: i64,
+) -> Result<i64, AppError> {
+    conn.execute(
+        "INSERT INTO file_entry (profile_id, original_md5, total_size, chunk_count)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![profile_id, original_md5, total_size, chunk_count],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_file_entry_by_id(conn: &Connection, id: i64) -> Result<Option<FileEntry>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, original_md5, total_size, chunk_count, created_at
+         FROM file_entry WHERE id = ?1",
     )?;
     let entry = stmt
         .query_row(params![id], |row| {
-            Ok(BackupEntry {
+            Ok(FileEntry {
                 id: row.get(0)?,
                 profile_id: row.get(1)?,
-                object_uuid: row.get(2)?,
-                original_md5: row.get(3)?,
-                encrypted_md5: row.get(4)?,
-                file_size: row.get(5)?,
-                created_at: row.get(6)?,
+                original_md5: row.get(2)?,
+                total_size: row.get(3)?,
+                chunk_count: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })
         .optional()?;
     Ok(entry)
 }
 
-pub fn list_backup_entries(conn: &Connection, profile_id: i64) -> Result<Vec<BackupEntry>, AppError> {
+pub fn get_file_entry_by_md5(
+    conn: &Connection,
+    profile_id: i64,
+    md5: &str,
+) -> Result<Option<FileEntry>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, profile_id, object_uuid, original_md5, encrypted_md5, file_size, created_at
-         FROM backup_entry WHERE profile_id = ?1 ORDER BY id",
+        "SELECT id, profile_id, original_md5, total_size, chunk_count, created_at
+         FROM file_entry WHERE profile_id = ?1 AND original_md5 = ?2",
+    )?;
+    let entry = stmt
+        .query_row(params![profile_id, md5], |row| {
+            Ok(FileEntry {
+                id: row.get(0)?,
+                profile_id: row.get(1)?,
+                original_md5: row.get(2)?,
+                total_size: row.get(3)?,
+                chunk_count: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })
+        .optional()?;
+    Ok(entry)
+}
+
+pub fn list_file_entries(conn: &Connection, profile_id: i64) -> Result<Vec<FileEntry>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, profile_id, original_md5, total_size, chunk_count, created_at
+         FROM file_entry WHERE profile_id = ?1 ORDER BY id",
     )?;
     let entries = stmt
         .query_map(params![profile_id], |row| {
-            Ok(BackupEntry {
+            Ok(FileEntry {
                 id: row.get(0)?,
                 profile_id: row.get(1)?,
-                object_uuid: row.get(2)?,
-                original_md5: row.get(3)?,
-                encrypted_md5: row.get(4)?,
-                file_size: row.get(5)?,
-                created_at: row.get(6)?,
+                original_md5: row.get(2)?,
+                total_size: row.get(3)?,
+                chunk_count: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(entries)
 }
 
-pub fn delete_backup_entry(conn: &Connection, id: i64) -> Result<(), AppError> {
-    conn.execute("DELETE FROM backup_entry WHERE id = ?1", params![id])?;
+pub fn delete_file_entry(conn: &Connection, id: i64) -> Result<(), AppError> {
+    conn.execute("DELETE FROM file_entry WHERE id = ?1", params![id])?;
     Ok(())
 }
 
-pub fn update_backup_entry_uuid(conn: &Connection, id: i64, new_uuid: &str) -> Result<(), AppError> {
+// ── FileChunk CRUD ──
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FileChunk {
+    pub id: i64,
+    pub file_entry_id: i64,
+    pub chunk_index: i64,
+    pub chunk_id: i64,
+}
+
+pub fn insert_file_chunk(
+    conn: &Connection,
+    file_entry_id: i64,
+    chunk_index: i64,
+    chunk_id: i64,
+) -> Result<i64, AppError> {
     conn.execute(
-        "UPDATE backup_entry SET object_uuid = ?1 WHERE id = ?2",
-        params![new_uuid, id],
+        "INSERT INTO file_chunk (file_entry_id, chunk_index, chunk_id)
+         VALUES (?1, ?2, ?3)",
+        params![file_entry_id, chunk_index, chunk_id],
     )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Returns (chunk_index, s3_key) ordered by chunk_index for restoring a file.
+pub fn get_chunk_keys_for_file(
+    conn: &Connection,
+    file_entry_id: i64,
+) -> Result<Vec<(usize, String)>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT fc.chunk_index, c.s3_key
+         FROM file_chunk fc JOIN chunk c ON fc.chunk_id = c.id
+         WHERE fc.file_entry_id = ?1
+         ORDER BY fc.chunk_index",
+    )?;
+    let keys = stmt
+        .query_map(params![file_entry_id], |row| {
+            Ok((row.get::<_, i64>(0)? as usize, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(keys)
+}
+
+/// Returns the chunk_ids for a file entry (for scramble deduplication check).
+pub fn get_chunk_ids_for_file(
+    conn: &Connection,
+    file_entry_id: i64,
+) -> Result<Vec<i64>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id FROM file_chunk WHERE file_entry_id = ?1 ORDER BY chunk_index",
+    )?;
+    let ids = stmt
+        .query_map(params![file_entry_id], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Count how many distinct file_entries use a given chunk_id.
+pub fn count_file_entries_for_chunk(conn: &Connection, chunk_id: i64) -> Result<i64, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(DISTINCT file_entry_id) FROM file_chunk WHERE chunk_id = ?1",
+    )?;
+    let count: i64 = stmt.query_row(params![chunk_id], |row| row.get(0))?;
+    Ok(count)
+}
+
+// ── LocalFile CRUD ──
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LocalFile {
+    pub id: i64,
+    pub file_entry_id: i64,
+    pub local_path: String,
+    pub cached_mtime: Option<f64>,
+    pub cached_size: Option<i64>,
+    pub updated_at: String,
+}
+
+/// Insert or update a local_file record. Updates file_entry_id, mtime, size if path already exists.
+pub fn upsert_local_file(
+    conn: &Connection,
+    file_entry_id: i64,
+    local_path: &str,
+    cached_mtime: Option<f64>,
+    cached_size: Option<i64>,
+) -> Result<i64, AppError> {
+    conn.execute(
+        "INSERT INTO local_file (file_entry_id, local_path, cached_mtime, cached_size)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(local_path) DO UPDATE SET
+             file_entry_id = excluded.file_entry_id,
+             cached_mtime = excluded.cached_mtime,
+             cached_size = excluded.cached_size,
+             updated_at = CURRENT_TIMESTAMP",
+        params![file_entry_id, local_path, cached_mtime, cached_size],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn get_local_file_by_path(
+    conn: &Connection,
+    local_path: &str,
+) -> Result<Option<LocalFile>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_entry_id, local_path, cached_mtime, cached_size, updated_at
+         FROM local_file WHERE local_path = ?1",
+    )?;
+    let file = stmt
+        .query_row(params![local_path], |row| {
+            Ok(LocalFile {
+                id: row.get(0)?,
+                file_entry_id: row.get(1)?,
+                local_path: row.get(2)?,
+                cached_mtime: row.get(3)?,
+                cached_size: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })
+        .optional()?;
+    Ok(file)
+}
+
+pub fn get_local_file_by_id(conn: &Connection, id: i64) -> Result<Option<LocalFile>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_entry_id, local_path, cached_mtime, cached_size, updated_at
+         FROM local_file WHERE id = ?1",
+    )?;
+    let file = stmt
+        .query_row(params![id], |row| {
+            Ok(LocalFile {
+                id: row.get(0)?,
+                file_entry_id: row.get(1)?,
+                local_path: row.get(2)?,
+                cached_mtime: row.get(3)?,
+                cached_size: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })
+        .optional()?;
+    Ok(file)
+}
+
+pub fn list_local_files_for_entry(
+    conn: &Connection,
+    file_entry_id: i64,
+) -> Result<Vec<LocalFile>, AppError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_entry_id, local_path, cached_mtime, cached_size, updated_at
+         FROM local_file WHERE file_entry_id = ?1 ORDER BY id",
+    )?;
+    let files = stmt
+        .query_map(params![file_entry_id], |row| {
+            Ok(LocalFile {
+                id: row.get(0)?,
+                file_entry_id: row.get(1)?,
+                local_path: row.get(2)?,
+                cached_mtime: row.get(3)?,
+                cached_size: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(files)
+}
+
+pub fn delete_local_file(conn: &Connection, id: i64) -> Result<(), AppError> {
+    conn.execute("DELETE FROM local_file WHERE id = ?1", params![id])?;
     Ok(())
 }
 
@@ -429,20 +685,20 @@ pub fn invalidate_share_manifest(conn: &Connection, id: i64) -> Result<(), AppEr
 pub struct ShareManifestEntry {
     pub id: i64,
     pub share_manifest_id: i64,
-    pub backup_entry_id: i64,
+    pub file_entry_id: i64,
     pub filename: String,
 }
 
 pub fn insert_share_manifest_entry(
     conn: &Connection,
     share_manifest_id: i64,
-    backup_entry_id: i64,
+    file_entry_id: i64,
     filename: &str,
 ) -> Result<i64, AppError> {
     conn.execute(
-        "INSERT INTO share_manifest_entry (share_manifest_id, backup_entry_id, filename)
+        "INSERT INTO share_manifest_entry (share_manifest_id, file_entry_id, filename)
          VALUES (?1, ?2, ?3)",
-        params![share_manifest_id, backup_entry_id, filename],
+        params![share_manifest_id, file_entry_id, filename],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -452,7 +708,7 @@ pub fn list_share_manifest_entries(
     share_manifest_id: i64,
 ) -> Result<Vec<ShareManifestEntry>, AppError> {
     let mut stmt = conn.prepare(
-        "SELECT id, share_manifest_id, backup_entry_id, filename
+        "SELECT id, share_manifest_id, file_entry_id, filename
          FROM share_manifest_entry WHERE share_manifest_id = ?1 ORDER BY id",
     )?;
     let entries = stmt
@@ -460,7 +716,7 @@ pub fn list_share_manifest_entries(
             Ok(ShareManifestEntry {
                 id: row.get(0)?,
                 share_manifest_id: row.get(1)?,
-                backup_entry_id: row.get(2)?,
+                file_entry_id: row.get(2)?,
                 filename: row.get(3)?,
             })
         })?
@@ -468,95 +724,12 @@ pub fn list_share_manifest_entries(
     Ok(entries)
 }
 
-// ── LocalFile CRUD ──
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct LocalFile {
-    pub id: i64,
-    pub backup_entry_id: i64,
-    pub local_path: String,
-    pub cached_mtime: Option<f64>,
-    pub cached_size: Option<i64>,
-    pub updated_at: String,
-}
-
-pub fn insert_local_file(
-    conn: &Connection,
-    backup_entry_id: i64,
-    local_path: &str,
-    cached_mtime: Option<f64>,
-    cached_size: Option<i64>,
-) -> Result<i64, AppError> {
-    conn.execute(
-        "INSERT INTO local_file (backup_entry_id, local_path, cached_mtime, cached_size)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![backup_entry_id, local_path, cached_mtime, cached_size],
-    )?;
-    Ok(conn.last_insert_rowid())
-}
-
 #[cfg(test)]
-pub fn get_local_file_by_path(
-    conn: &Connection,
-    backup_entry_id: i64,
-    local_path: &str,
-) -> Result<Option<LocalFile>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, backup_entry_id, local_path, cached_mtime, cached_size, updated_at
-         FROM local_file WHERE backup_entry_id = ?1 AND local_path = ?2",
-    )?;
-    let file = stmt
-        .query_row(params![backup_entry_id, local_path], |row| {
-            Ok(LocalFile {
-                id: row.get(0)?,
-                backup_entry_id: row.get(1)?,
-                local_path: row.get(2)?,
-                cached_mtime: row.get(3)?,
-                cached_size: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })
-        .optional()?;
-    Ok(file)
-}
-
-pub fn list_local_files(conn: &Connection, backup_entry_id: i64) -> Result<Vec<LocalFile>, AppError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, backup_entry_id, local_path, cached_mtime, cached_size, updated_at
-         FROM local_file WHERE backup_entry_id = ?1 ORDER BY id",
-    )?;
-    let files = stmt
-        .query_map(params![backup_entry_id], |row| {
-            Ok(LocalFile {
-                id: row.get(0)?,
-                backup_entry_id: row.get(1)?,
-                local_path: row.get(2)?,
-                cached_mtime: row.get(3)?,
-                cached_size: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(files)
-}
-
-#[cfg(test)]
-pub fn update_local_file_cache(
-    conn: &Connection,
-    id: i64,
-    cached_mtime: Option<f64>,
-    cached_size: Option<i64>,
-) -> Result<(), AppError> {
-    conn.execute(
-        "UPDATE local_file SET cached_mtime = ?1, cached_size = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
-        params![cached_mtime, cached_size, id],
-    )?;
-    Ok(())
-}
-
-pub fn delete_local_file(conn: &Connection, id: i64) -> Result<(), AppError> {
-    conn.execute("DELETE FROM local_file WHERE id = ?1", params![id])?;
-    Ok(())
+pub fn open_test_db() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    migrate_to_v5(&conn).unwrap();
+    conn
 }
 
 #[cfg(test)]
@@ -564,10 +737,7 @@ mod tests {
     use super::*;
 
     fn setup_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        super::create_schema(&conn).unwrap();
-        conn
+        open_test_db()
     }
 
     // ── Profile tests ──
@@ -575,21 +745,22 @@ mod tests {
     #[test]
     fn test_insert_and_get_profile() {
         let conn = setup_db();
-        let id = insert_profile(&conn, "test", "read-write", "https://s3.example.com", Some("us-east-1"), "my-bucket", None, None, None, None, None).unwrap();
+        let id = insert_profile(&conn, "test", "read-write", "https://s3.example.com", Some("us-east-1"), "my-bucket", None, None, None, None, 10485760).unwrap();
         let profile = get_profile_by_id(&conn, id).unwrap().unwrap();
         assert_eq!(profile.name, "test");
         assert_eq!(profile.mode, "read-write");
         assert_eq!(profile.s3_endpoint, "https://s3.example.com");
         assert_eq!(profile.s3_region, Some("us-east-1".into()));
         assert_eq!(profile.s3_bucket, "my-bucket");
+        assert_eq!(profile.chunk_size_bytes, 10485760);
         assert!(!profile.is_active);
     }
 
     #[test]
     fn test_list_profiles() {
         let conn = setup_db();
-        insert_profile(&conn, "p1", "read-write", "https://s3.a.com", None, "b1", None, None, None, None, None).unwrap();
-        insert_profile(&conn, "p2", "read-only", "https://s3.b.com", None, "b2", None, None, None, None, None).unwrap();
+        insert_profile(&conn, "p1", "read-write", "https://s3.a.com", None, "b1", None, None, None, None, 10485760).unwrap();
+        insert_profile(&conn, "p2", "read-only", "https://s3.b.com", None, "b2", None, None, None, None, 10485760).unwrap();
         let profiles = list_profiles(&conn).unwrap();
         assert_eq!(profiles.len(), 2);
         assert_eq!(profiles[0].name, "p1");
@@ -599,8 +770,8 @@ mod tests {
     #[test]
     fn test_set_active_profile() {
         let conn = setup_db();
-        let id1 = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None).unwrap();
-        let id2 = insert_profile(&conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, None).unwrap();
+        let id1 = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, 10485760).unwrap();
+        let id2 = insert_profile(&conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, 10485760).unwrap();
         set_active_profile(&conn, id1).unwrap();
         assert!(get_profile_by_id(&conn, id1).unwrap().unwrap().is_active);
         assert!(!get_profile_by_id(&conn, id2).unwrap().unwrap().is_active);
@@ -613,49 +784,124 @@ mod tests {
     #[test]
     fn test_delete_profile() {
         let conn = setup_db();
-        let id = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None).unwrap();
+        let id = insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, 10485760).unwrap();
         delete_profile(&conn, id).unwrap();
         assert!(get_profile_by_id(&conn, id).unwrap().is_none());
     }
 
+    // ── Chunk tests ──
+
     #[test]
-    fn test_unique_profile_name() {
+    fn test_chunk_crud() {
         let conn = setup_db();
-        insert_profile(&conn, "same-name", "read-write", "https://a.com", None, "b1", None, None, None, None, None).unwrap();
-        let result = insert_profile(&conn, "same-name", "read-write", "https://b.com", None, "b2", None, None, None, None, None);
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+
+        let cid = insert_chunk(&conn, pid, "hash-abc", "prefix/c/hash-abc", 1024).unwrap();
+        let chunk = get_chunk_by_id(&conn, cid).unwrap().unwrap();
+        assert_eq!(chunk.chunk_hash, "hash-abc");
+        assert_eq!(chunk.s3_key, "prefix/c/hash-abc");
+        assert_eq!(chunk.encrypted_size, 1024);
+
+        let found_id = get_chunk_id_by_hash(&conn, pid, "hash-abc").unwrap();
+        assert_eq!(found_id, Some(cid));
+
+        let not_found = get_chunk_id_by_hash(&conn, pid, "missing").unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_chunk_unique_constraint() {
+        let conn = setup_db();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        insert_chunk(&conn, pid, "hash-abc", "prefix/c/hash-abc", 1024).unwrap();
+        let result = insert_chunk(&conn, pid, "hash-abc", "prefix/c/hash-abc", 1024);
         assert!(result.is_err());
     }
 
-    // ── BackupEntry tests ──
+    // ── FileEntry tests ──
 
     #[test]
-    fn test_backup_entry_crud() {
+    fn test_file_entry_crud() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
 
-        let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5orig", "md5enc", 1024).unwrap();
-        let entry = get_backup_entry_by_id(&conn, eid).unwrap().unwrap();
-        assert_eq!(entry.object_uuid, "uuid-1");
-        assert_eq!(entry.file_size, 1024);
+        let feid = insert_file_entry(&conn, pid, "md5abc", 2048, 1).unwrap();
+        let fe = get_file_entry_by_id(&conn, feid).unwrap().unwrap();
+        assert_eq!(fe.original_md5, "md5abc");
+        assert_eq!(fe.total_size, 2048);
+        assert_eq!(fe.chunk_count, 1);
 
-        let entries = list_backup_entries(&conn, pid).unwrap();
+        let fe2 = get_file_entry_by_md5(&conn, pid, "md5abc").unwrap().unwrap();
+        assert_eq!(fe2.id, feid);
+
+        let entries = list_file_entries(&conn, pid).unwrap();
         assert_eq!(entries.len(), 1);
 
-        update_backup_entry_uuid(&conn, eid, "uuid-2").unwrap();
-        let entry = get_backup_entry_by_id(&conn, eid).unwrap().unwrap();
-        assert_eq!(entry.object_uuid, "uuid-2");
-
-        delete_backup_entry(&conn, eid).unwrap();
-        assert!(get_backup_entry_by_id(&conn, eid).unwrap().is_none());
+        delete_file_entry(&conn, feid).unwrap();
+        assert!(get_file_entry_by_id(&conn, feid).unwrap().is_none());
     }
 
     #[test]
-    fn test_backup_entry_unique_uuid_per_profile() {
+    fn test_file_entry_unique_md5_per_profile() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
-        insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
-        let result = insert_backup_entry(&conn, pid, "uuid-1", "md5c", "md5d", 200);
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        insert_file_entry(&conn, pid, "md5abc", 100, 1).unwrap();
+        let result = insert_file_entry(&conn, pid, "md5abc", 200, 2);
         assert!(result.is_err());
+    }
+
+    // ── FileChunk tests ──
+
+    #[test]
+    fn test_file_chunk_and_restore_keys() {
+        let conn = setup_db();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        let cid0 = insert_chunk(&conn, pid, "hash0", "prefix/c/hash0", 100).unwrap();
+        let cid1 = insert_chunk(&conn, pid, "hash1", "prefix/c/hash1", 100).unwrap();
+        let feid = insert_file_entry(&conn, pid, "md5abc", 200, 2).unwrap();
+
+        insert_file_chunk(&conn, feid, 0, cid0).unwrap();
+        insert_file_chunk(&conn, feid, 1, cid1).unwrap();
+
+        let keys = get_chunk_keys_for_file(&conn, feid).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], (0, "prefix/c/hash0".to_string()));
+        assert_eq!(keys[1], (1, "prefix/c/hash1".to_string()));
+    }
+
+    // ── LocalFile tests ──
+
+    #[test]
+    fn test_local_file_upsert() {
+        let conn = setup_db();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        let feid1 = insert_file_entry(&conn, pid, "md5a", 100, 1).unwrap();
+        let feid2 = insert_file_entry(&conn, pid, "md5b", 200, 1).unwrap();
+
+        // Initial insert
+        upsert_local_file(&conn, feid1, "/home/user/file.txt", Some(1234.5), Some(100)).unwrap();
+        let lf = get_local_file_by_path(&conn, "/home/user/file.txt").unwrap().unwrap();
+        assert_eq!(lf.file_entry_id, feid1);
+        assert_eq!(lf.cached_mtime, Some(1234.5));
+
+        // Upsert with new file_entry (file changed)
+        upsert_local_file(&conn, feid2, "/home/user/file.txt", Some(5678.0), Some(200)).unwrap();
+        let lf2 = get_local_file_by_path(&conn, "/home/user/file.txt").unwrap().unwrap();
+        assert_eq!(lf2.file_entry_id, feid2);
+        assert_eq!(lf2.cached_mtime, Some(5678.0));
+    }
+
+    #[test]
+    fn test_local_file_list_for_entry() {
+        let conn = setup_db();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        let feid = insert_file_entry(&conn, pid, "md5a", 100, 1).unwrap();
+
+        upsert_local_file(&conn, feid, "/path/file1.txt", None, None).unwrap();
+        upsert_local_file(&conn, feid, "/path/file2.txt", None, None).unwrap();
+
+        let files = list_local_files_for_entry(&conn, feid).unwrap();
+        assert_eq!(files.len(), 2);
     }
 
     // ── ShareManifest tests ──
@@ -663,79 +909,27 @@ mod tests {
     #[test]
     fn test_share_manifest_crud() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        let feid = insert_file_entry(&conn, pid, "md5a", 100, 1).unwrap();
 
-        let mid = insert_share_manifest(&conn, pid, "manifest-uuid", Some("my share"), 3).unwrap();
+        let mid = insert_share_manifest(&conn, pid, "manifest-uuid", Some("my share"), 1).unwrap();
         let manifest = get_share_manifest_by_id(&conn, mid).unwrap().unwrap();
         assert_eq!(manifest.manifest_uuid, "manifest-uuid");
         assert_eq!(manifest.label, Some("my share".into()));
-        assert_eq!(manifest.file_count, 3);
         assert!(manifest.is_valid);
 
-        invalidate_share_manifest(&conn, mid).unwrap();
-        let manifest = get_share_manifest_by_id(&conn, mid).unwrap().unwrap();
-        assert!(!manifest.is_valid);
+        insert_share_manifest_entry(&conn, mid, feid, "file.txt").unwrap();
+        let entries = list_share_manifest_entries(&conn, mid).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].file_entry_id, feid);
+        assert_eq!(entries[0].filename, "file.txt");
 
-        let manifests = list_share_manifests(&conn, pid).unwrap();
-        assert_eq!(manifests.len(), 1);
+        invalidate_share_manifest(&conn, mid).unwrap();
+        assert!(!get_share_manifest_by_id(&conn, mid).unwrap().unwrap().is_valid);
 
         delete_share_manifest(&conn, mid).unwrap();
         assert!(get_share_manifest_by_id(&conn, mid).unwrap().is_none());
-    }
-
-    // ── ShareManifestEntry tests ──
-
-    #[test]
-    fn test_share_manifest_entries() {
-        let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
-        let eid1 = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
-        let eid2 = insert_backup_entry(&conn, pid, "uuid-2", "md5c", "md5d", 200).unwrap();
-        let mid = insert_share_manifest(&conn, pid, "manifest-1", None, 2).unwrap();
-
-        insert_share_manifest_entry(&conn, mid, eid1, "file1.txt").unwrap();
-        insert_share_manifest_entry(&conn, mid, eid2, "file2.txt").unwrap();
-
-        let entries = list_share_manifest_entries(&conn, mid).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].filename, "file1.txt");
-        assert_eq!(entries[1].filename, "file2.txt");
-    }
-
-    // ── LocalFile tests ──
-
-    #[test]
-    fn test_local_file_crud() {
-        let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
-        let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
-
-        let lfid = insert_local_file(&conn, eid, "/home/user/file.txt", Some(1234.5), Some(100)).unwrap();
-        let lf = get_local_file_by_path(&conn, eid, "/home/user/file.txt").unwrap().unwrap();
-        assert_eq!(lf.local_path, "/home/user/file.txt");
-        assert_eq!(lf.cached_mtime, Some(1234.5));
-        assert_eq!(lf.cached_size, Some(100));
-
-        update_local_file_cache(&conn, lfid, Some(5678.0), Some(200)).unwrap();
-        let lf = get_local_file_by_path(&conn, eid, "/home/user/file.txt").unwrap().unwrap();
-        assert_eq!(lf.cached_mtime, Some(5678.0));
-        assert_eq!(lf.cached_size, Some(200));
-
-        let files = list_local_files(&conn, eid).unwrap();
-        assert_eq!(files.len(), 1);
-
-        delete_local_file(&conn, lfid).unwrap();
-        assert!(get_local_file_by_path(&conn, eid, "/home/user/file.txt").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_local_file_unique_constraint() {
-        let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
-        let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
-        insert_local_file(&conn, eid, "/path/file.txt", None, None).unwrap();
-        let result = insert_local_file(&conn, eid, "/path/file.txt", None, None);
-        assert!(result.is_err());
+        assert!(list_share_manifest_entries(&conn, mid).unwrap().is_empty());
     }
 
     // ── Schema versioning ──
@@ -746,7 +940,7 @@ mod tests {
         let db_path = dir.path().join("test.db");
         let conn = init_database(db_path.to_str().unwrap()).unwrap();
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -757,7 +951,7 @@ mod tests {
         // First init
         {
             let conn = init_database(db_path.to_str().unwrap()).unwrap();
-            insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
+            insert_profile(&conn, "p1", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
         }
 
         // Second init should not lose data
@@ -774,23 +968,22 @@ mod tests {
     #[test]
     fn test_foreign_key_enforcement() {
         let conn = setup_db();
-        // Insert backup_entry referencing non-existent profile
-        let result = insert_backup_entry(&conn, 999, "uuid", "md5a", "md5b", 100);
+        // Insert file_entry referencing non-existent profile
+        let result = insert_file_entry(&conn, 999, "md5", 100, 1);
         assert!(result.is_err());
     }
 
-    // ── Cascade-like behavior through delete_share_manifest ──
-
     #[test]
-    fn test_delete_share_manifest_cascades_entries() {
+    fn test_count_file_entries_for_chunk() {
         let conn = setup_db();
-        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, None).unwrap();
-        let eid = insert_backup_entry(&conn, pid, "uuid-1", "md5a", "md5b", 100).unwrap();
-        let mid = insert_share_manifest(&conn, pid, "manifest-1", None, 1).unwrap();
-        insert_share_manifest_entry(&conn, mid, eid, "file.txt").unwrap();
+        let pid = insert_profile(&conn, "p", "read-write", "https://a.com", None, "b", None, None, None, None, 10485760).unwrap();
+        let cid = insert_chunk(&conn, pid, "hash-shared", "prefix/c/hash-shared", 100).unwrap();
+        let feid1 = insert_file_entry(&conn, pid, "md5a", 100, 1).unwrap();
+        let feid2 = insert_file_entry(&conn, pid, "md5b", 100, 1).unwrap();
+        insert_file_chunk(&conn, feid1, 0, cid).unwrap();
+        insert_file_chunk(&conn, feid2, 0, cid).unwrap();
 
-        delete_share_manifest(&conn, mid).unwrap();
-        let entries = list_share_manifest_entries(&conn, mid).unwrap();
-        assert!(entries.is_empty());
+        let count = count_file_entries_for_chunk(&conn, cid).unwrap();
+        assert_eq!(count, 2);
     }
 }

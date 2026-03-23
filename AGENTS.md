@@ -6,7 +6,7 @@ This document is the primary reference for AI agents (Claude, Cursor, Copilot, e
 
 ## What Is This App
 
-**Harpocrates** is a cross-platform desktop app (Tauri v2) that encrypts files client-side with AES-256-GCM and backs them up to any S3-compatible bucket. The user's encryption key is generated at first use and never stored by the app — only the user holds it.
+**Harpocrates** is a cross-platform desktop app (Tauri v2) that encrypts files client-side with XChaCha20-Poly1305 and backs them up to any S3-compatible bucket using content-addressed chunk storage. The user's encryption key is generated at first use and never stored by the app — only the user holds it.
 
 Tech stack: **Tauri v2 + Rust backend + SvelteKit (Svelte 5 runes) frontend**.
 
@@ -24,7 +24,7 @@ harpocrates/
 │   │   ├── files/+page.svelte  # File browser, upload, restore, verify
 │   │   ├── settings/+page.svelte # Profiles, bandwidth throttle, DB export/import
 │   │   ├── share/+page.svelte  # Create/receive/manage share manifests
-│   │   ├── scramble/+page.svelte # Re-encrypt files with new UUIDs
+│   │   ├── scramble/+page.svelte # Move exclusive chunks to new random S3 keys; invalidates share manifests
 │   │   ├── cleanup/+page.svelte  # Orphan detection and removal
 │   │   └── setup/+page.svelte  # First-run profile creation wizard
 │   └── lib/
@@ -47,10 +47,10 @@ harpocrates/
 │   ├── lib.rs              # App entry, managed state, invoke_handler registry
 │   ├── main.rs             # Binary entry point (calls harpocrates_lib::run())
 │   ├── commands.rs         # Every #[tauri::command] fn
-│   ├── backup.rs           # Directory backup: change detection, dedup, skip patterns; make_s3_key()
+│   ├── backup.rs           # Chunk pipeline: scan, HMAC dedup, encrypt, upload; make_chunk_s3_key()
 │   ├── queue.rs            # Serial OperationQueue for all S3-touching ops; emits queue/op/progress events
-│   ├── s3.rs               # S3Client: upload, download, list, multipart, throttle
-│   ├── crypto.rs           # AES-256-GCM + Argon2id; temp file prefix: "harpocrates-tmp-"
+│   ├── s3.rs               # S3Client: upload_chunk, download_chunk, list, throttle
+│   ├── crypto.rs           # XChaCha20-Poly1305 chunk encrypt/decrypt; HMAC-SHA256 chunk identity; key decode
 │   ├── db.rs               # SQLite schema + CRUD
 │   ├── profiles.rs         # Profile CRUD, integrates credentials.rs
 │   ├── credentials.rs      # Keyring wrapper; service prefix: "harpocrates"
@@ -126,7 +126,7 @@ All state uses the Svelte 5 runes API — **no Svelte 4 stores (`writable`, `rea
 ```typescript
 let count = $state(0);                    // reactive state
 let doubled = $derived(count * 2);        // derived (replaces $: )
-$effect(() => { doSomething(count); });   // side effect (replaces onMount + reactive statements)
+$effect(() => { doSomething(count); });   // side effect that re-runs when tracked state changes
 let { label, onclose } = $props();        // component props
 
 // Snapshot a prop at mount time (avoid re-running when prop changes):
@@ -286,31 +286,35 @@ return Err(AppError::Config("something went wrong".into()));
 
 ### Database
 
-SQLite at `~/.harpocrates/harpocrates.db`. Schema managed in `db.rs`. Current schema version: **3** (migrations run automatically in `init_database` on first open).
+SQLite at `~/.harpocrates/harpocrates.db`. Schema managed in `db.rs`. Current schema version: **5** (migrated automatically in `init_database` on first open — drops and recreates all tables).
 
 | Table | Key columns |
 |-------|-------------|
-| `profile` | id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, is_active |
-| `backup_entry` | id, profile_id, object_uuid, original_md5, encrypted_md5, file_size |
-| `local_file` | id, backup_entry_id, local_path, cached_mtime, cached_size |
+| `profile` | id, name, mode, s3_endpoint, s3_region, s3_bucket, extra_env, relative_path, temp_directory, s3_key_prefix, chunk_size_bytes, is_active |
+| `chunk` | id, profile_id, chunk_hash, s3_key, encrypted_size |
+| `file_entry` | id, profile_id, original_md5, total_size, chunk_count |
+| `file_chunk` | id, file_entry_id, chunk_index, chunk_id |
+| `local_file` | id, file_entry_id, local_path, cached_mtime, cached_size |
 | `share_manifest` | id, profile_id, manifest_uuid, label, file_count, is_valid |
-| `share_manifest_entry` | id, share_manifest_id, backup_entry_id, filename |
+| `share_manifest_entry` | id, share_manifest_id, file_entry_id, filename |
 
-**`object_uuid`** in `backup_entry` is the full S3 object key — it includes the profile's `s3_key_prefix` if one is set (e.g. `team-alpha/550e8400-...`). Never strip or reformat this value before passing it to S3 operations.
+**Chunk identity:** `chunk.chunk_hash` is `HMAC-SHA256(encryption_key, plaintext_chunk)` hex-encoded. This acts as both the dedup key and the resume check — a chunk already in DB (for this profile) is never re-uploaded.
 
-Deduplication works by matching `original_md5` — two local files with identical content share one `backup_entry` and one S3 object.
+**Whole-file dedup:** `file_entry.original_md5` is the MD5 of the full plaintext file, computed as a rolling hash during the chunking pass. If a `file_entry` with the same MD5 already exists when a backup completes, the outcome is `Deduped` — only `local_file` is upserted.
+
+**S3 key format:** `{prefix}/c/{chunk_hash}` (or `c/{chunk_hash}` without a prefix). Use `backup::make_chunk_s3_key(prefix, hash)` — never format manually.
 
 **`relative_path`** (profile field) is a local filesystem prefix stripped from file paths before they are stored in `local_file.local_path`. It is used to make stored paths relative so they can be restored on a different machine. It has no effect on S3 object keys.
 
-**`s3_key_prefix`** (profile field) is prepended to every S3 object key for this profile, enabling per-prefix IAM policies on a shared bucket. Use `backup::make_s3_key(prefix, uuid)` to construct keys — never format them manually. Validated and normalised by `profiles::validate_s3_key_prefix` (strips surrounding slashes/whitespace, rejects `//` and control characters, max 200 chars).
+**`s3_key_prefix`** (profile field) is prepended to every S3 chunk key for this profile, enabling per-prefix IAM policies on a shared bucket. Validated and normalised by `profiles::validate_s3_key_prefix` (strips surrounding slashes/whitespace, rejects `//` and control characters, max 200 chars).
 
 ### Keyring
 
 S3 credentials and encryption keys are stored in the OS keychain via `credentials.rs`. Service names follow the pattern `harpocrates:{profile_name}:{key_type}` where `key_type` is one of `s3-access-key`, `s3-secret-key`, `encryption-key`.
 
-### Temp Files
+### Chunk Encryption
 
-Temporary files during encryption/decryption use the prefix `harpocrates-tmp-{uuid}`. They are cleaned up at startup and after each operation. If a leftover temp file is found, it is safe to delete.
+Each chunk is encrypted as `[12-byte random nonce][ciphertext + 16-byte Poly1305 tag]` using XChaCha20-Poly1305. Chunks are small enough to encrypt entirely in memory — no temp files are written during backup.
 
 ---
 
@@ -355,7 +359,11 @@ Unit tests are in `#[cfg(test)] mod tests { ... }` blocks at the bottom of each 
 npm test
 ```
 
-Frontend tests live alongside their subjects (`ProfileForm.test.ts`, `share/page.test.ts`, `stores/*.test.ts`). Mock Tauri's `invoke` via `vi.mock('@tauri-apps/api/core')` — the global mock is set up in `vitest.setup.ts`.
+Frontend tests live alongside their subjects (`ProfileForm.test.ts`, `share/page.test.ts`, `stores/*.test.ts`, `routes/*/page.test.ts`). Mock Tauri's `invoke` via `vi.mock('@tauri-apps/api/core')` — the global mock is set up in `src/test/setup.ts`.
+
+`$app/navigation` is a SvelteKit virtual module that Vitest cannot resolve. Tests that render pages importing it must use `vi.mock('$app/navigation', ...)` — the alias to `src/mocks/app-navigation.ts` is configured in `vitest.config.ts`. Use `vi.hoisted(() => vi.fn())` for any mock values referenced inside `vi.mock()` factory functions.
+
+`vi.useFakeTimers()` must be called **after** an initial `waitFor()` — fake timers break `waitFor`'s internal `setInterval` polling if enabled before the first render settles.
 
 **Frontend type-checking:**
 ```bash

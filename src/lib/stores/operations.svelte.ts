@@ -65,8 +65,10 @@ function applyProgress(
   ops = ops.map((o) => {
     if (o.id !== op_id) return o;
 
-    // Remove this file from the pending list (first occurrence by name).
-    const pendingIdx = o.pendingFiles.indexOf(name);
+    // Remove this file from the pending list. Match on the full current_file
+    // value (which may be an absolute path) so that two files in different
+    // directories with the same basename are treated independently.
+    const pendingIdx = o.pendingFiles.indexOf(current_file);
     const newPendingFiles =
       pendingIdx >= 0
         ? [...o.pendingFiles.slice(0, pendingIdx), ...o.pendingFiles.slice(pendingIdx + 1)]

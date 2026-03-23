@@ -6,7 +6,10 @@ export default defineConfig({
   plugins: [svelte({ hot: false })],
   resolve: {
     conditions: ['browser'],
-    alias: { $lib: resolve('./src/lib') },
+    alias: {
+      $lib: resolve('./src/lib'),
+      '$app/navigation': resolve('./src/mocks/app-navigation.ts'),
+    },
   },
   test: {
     environment: 'happy-dom',

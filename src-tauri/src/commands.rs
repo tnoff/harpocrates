@@ -1,5 +1,4 @@
-use std::path::{Path, PathBuf};
-
+use std::path::Path;
 
 use tauri::State;
 
@@ -16,9 +15,7 @@ use crate::s3::S3Client;
 // Helpers
 // ══════════════════════════════════════════════════════
 
-fn get_active_profile_or_err(
-    conn: &rusqlite::Connection,
-) -> Result<db::Profile, AppError> {
+fn get_active_profile_or_err(conn: &rusqlite::Connection) -> Result<db::Profile, AppError> {
     profiles::get_active_profile(conn)?
         .ok_or_else(|| AppError::Config("No active profile set".into()))
 }
@@ -27,22 +24,10 @@ fn get_profile_encryption_key(profile: &db::Profile) -> Result<String, AppError>
     credentials::get_encryption_key(&profile.name)
 }
 
-fn get_temp_dir(profile: &db::Profile) -> PathBuf {
-    profile
-        .temp_directory
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-}
 
 async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
     let access_key = credentials::get_s3_access_key(&profile.name)?;
     let secret_key = credentials::get_s3_secret_key(&profile.name)?;
-    let part_size = profile
-        .upload_chunk_size_mb
-        .filter(|&mb| mb > 0)
-        .map(|mb| mb as usize * 1024 * 1024)
-        .unwrap_or(crate::crypto::DEFAULT_CHUNK_SIZE);
     S3Client::new(
         &profile.s3_endpoint,
         profile.s3_region.as_deref(),
@@ -51,9 +36,16 @@ async fn build_s3_client(profile: &db::Profile) -> Result<S3Client, AppError> {
         &secret_key,
         profile.extra_env.as_deref(),
         crate::throttle::global().clone(),
-        part_size,
     )
     .await
+}
+
+/// Build the S3 key for a share manifest (uses `m/` namespace).
+fn make_manifest_s3_key(prefix: Option<&str>, uuid: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{}/m/{}", p, uuid),
+        _ => format!("m/{}", uuid),
+    }
 }
 
 // ══════════════════════════════════════════════════════
@@ -67,8 +59,7 @@ pub fn get_table_count(db: State<DbState>) -> Result<usize, AppError> {
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )?;
     let count: i64 = stmt.query_row([], |row: &rusqlite::Row| row.get(0))?;
-    let count = count as usize;
-    Ok(count)
+    Ok(count as usize)
 }
 
 // ══════════════════════════════════════════════════════
@@ -89,7 +80,7 @@ pub struct CreateProfileInput {
     pub temp_directory: Option<String>,
     pub import_encryption_key: Option<String>,
     pub s3_key_prefix: Option<String>,
-    pub upload_chunk_size_mb: Option<i64>,
+    pub chunk_size_bytes: Option<i64>,
 }
 
 #[tauri::command]
@@ -112,7 +103,7 @@ pub fn create_profile(
         input.temp_directory.as_deref(),
         input.import_encryption_key.as_deref(),
         input.s3_key_prefix.as_deref(),
-        input.upload_chunk_size_mb,
+        input.chunk_size_bytes,
     )
 }
 
@@ -122,8 +113,6 @@ pub struct ProfileCredentials {
     pub s3_secret_key: String,
 }
 
-/// Retrieve the S3 access key and secret key for a profile from the OS keychain.
-/// Used to pre-populate credential fields when editing an existing profile.
 #[tauri::command]
 pub fn get_profile_credentials(
     db: State<DbState>,
@@ -170,7 +159,7 @@ pub struct UpdateProfileInput {
     pub relative_path: Option<Option<String>>,
     pub temp_directory: Option<Option<String>>,
     pub s3_key_prefix: Option<Option<String>>,
-    pub upload_chunk_size_mb: Option<Option<i64>>,
+    pub chunk_size_bytes: Option<i64>,
 }
 
 #[tauri::command]
@@ -193,7 +182,7 @@ pub fn update_profile(
         input.relative_path.as_ref().map(|o| o.as_deref()),
         input.temp_directory.as_ref().map(|o| o.as_deref()),
         input.s3_key_prefix.as_ref().map(|o| o.as_deref()),
-        input.upload_chunk_size_mb,
+        input.chunk_size_bytes,
     )
 }
 
@@ -231,7 +220,6 @@ pub async fn test_connection_params(
         &secret_key,
         extra_env.as_deref(),
         crate::throttle::global().clone(),
-        crate::crypto::DEFAULT_CHUNK_SIZE,
     )
     .await?;
     s3.head_bucket().await?;
@@ -242,7 +230,6 @@ pub async fn test_connection_params(
 // Queue management
 // ══════════════════════════════════════════════════════
 
-/// Cancel a queued or active operation.
 #[tauri::command]
 pub fn cancel_operation(
     queue: State<'_, OperationQueue>,
@@ -252,7 +239,6 @@ pub fn cancel_operation(
     Ok(())
 }
 
-/// Return the current queue snapshot (pending + active).
 #[tauri::command]
 pub fn get_queue(queue: State<'_, OperationQueue>) -> Result<QueueSnapshot, AppError> {
     Ok(queue.snapshot())
@@ -279,8 +265,6 @@ pub fn backup_file(
     Ok(id)
 }
 
-/// Enqueue a directory backup. Returns the op ID immediately.
-/// Returns an error if the same directory is already queued or active.
 #[tauri::command]
 pub fn backup_directory(
     queue: State<'_, OperationQueue>,
@@ -313,7 +297,7 @@ pub fn backup_directory(
 // Phase 6: Restore
 // ══════════════════════════════════════════════════════
 
-/// Enqueue a restore operation. Returns the op ID immediately.
+/// Enqueue a restore of the given file_entry IDs (called backup_entry_ids for API compat).
 #[tauri::command]
 pub fn restore_files(
     queue: State<'_, OperationQueue>,
@@ -326,7 +310,11 @@ pub fn restore_files(
     } else {
         format!("Restoring {} files", count)
     };
-    let id = queue.enqueue(label, "restore", OpParams::RestoreFiles { backup_entry_ids, target_directory });
+    let id = queue.enqueue(
+        label,
+        "restore",
+        OpParams::RestoreFiles { backup_entry_ids, target_directory },
+    );
     Ok(id)
 }
 
@@ -334,9 +322,10 @@ pub fn restore_files(
 // Phase 7: Share Manifests
 // ══════════════════════════════════════════════════════
 
+/// Describes one file inside a share manifest.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ManifestFileEntry {
-    pub uuid: String,
+    pub uuid: String,    // original_md5 — used as stable identifier for download selection
     pub filename: String,
     pub size: i64,
 }
@@ -345,6 +334,22 @@ pub struct ManifestFileEntry {
 pub struct ManifestFileList {
     pub manifest_uuid: String,
     pub files: Vec<ManifestFileEntry>,
+}
+
+/// Internal manifest JSON format stored in the encrypted S3 object.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestJson {
+    version: i32,
+    files: Vec<ManifestJsonFile>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ManifestJsonFile {
+    filename: String,
+    original_md5: String,
+    total_size: i64,
+    /// Ordered list of (chunk_index, s3_key) pairs for restoring this file.
+    chunks: Vec<String>,
 }
 
 #[tauri::command]
@@ -356,54 +361,66 @@ pub async fn create_share_manifest(
     let (profile, entries_with_filenames) = {
         let conn = db.conn()?;
         let profile = get_active_profile_or_err(&conn)?;
-        let mut entries = Vec::new();
+        let mut entries: Vec<(db::FileEntry, String, Vec<String>)> = Vec::new();
         for id in &backup_entry_ids {
-            if let Some(entry) = db::get_backup_entry_by_id(&conn, *id)? {
-                let local_files = db::list_local_files(&conn, entry.id)?;
-                let filename = local_files.first()
-                    .map(|lf| Path::new(&lf.local_path).file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| lf.local_path.clone()))
-                    .unwrap_or_else(|| entry.object_uuid.clone());
-                entries.push((entry, filename));
+            if let Some(entry) = db::get_file_entry_by_id(&conn, *id)? {
+                // Get filename from local_file
+                let local_files = db::list_local_files_for_entry(&conn, entry.id)?;
+                let filename = local_files
+                    .first()
+                    .map(|lf| {
+                        Path::new(&lf.local_path)
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_else(|| lf.local_path.clone())
+                    })
+                    .unwrap_or_else(|| entry.original_md5.clone());
+                // Get ordered chunk S3 keys
+                let chunk_keys: Vec<String> = db::get_chunk_keys_for_file(&conn, entry.id)?
+                    .into_iter()
+                    .map(|(_, s3_key)| s3_key)
+                    .collect();
+                entries.push((entry, filename, chunk_keys));
             }
         }
         (profile, entries)
     };
 
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
+    let key_hex = get_profile_encryption_key(&profile)?;
+    let key_bytes = crypto::decode_encryption_key(&key_hex)?;
     let s3 = build_s3_client(&profile).await?;
 
-    let manifest_files: Vec<ManifestFileEntry> = entries_with_filenames.iter()
-        .map(|(e, filename)| ManifestFileEntry {
-            uuid: e.object_uuid.clone(),
-            filename: filename.clone(),
-            size: e.file_size,
-        })
-        .collect();
+    let manifest_json = ManifestJson {
+        version: 2,
+        files: entries_with_filenames
+            .iter()
+            .map(|(e, filename, chunks)| ManifestJsonFile {
+                filename: filename.clone(),
+                original_md5: e.original_md5.clone(),
+                total_size: e.total_size,
+                chunks: chunks.clone(),
+            })
+            .collect(),
+    };
 
-    let manifest_json = serde_json::to_vec(&serde_json::json!({ "files": manifest_files }))?;
+    let manifest_bytes = serde_json::to_vec(&manifest_json)?;
+    let encrypted = crypto::encrypt_chunk(&key_bytes, &manifest_bytes)?;
 
-    let temp_plain = crypto::generate_temp_path(&temp_dir);
-    let temp_encrypted = crypto::generate_temp_path(&temp_dir);
-    std::fs::write(&temp_plain, &manifest_json)?;
-    crypto::encrypt_file(&temp_plain, &temp_encrypted, &encryption_key)?;
-    let _ = std::fs::remove_file(&temp_plain);
-
-    let manifest_uuid = backup::make_s3_key(profile.s3_key_prefix.as_deref(), &uuid::Uuid::new_v4().to_string());
-    let upload_result = s3.upload_object(&manifest_uuid, &temp_encrypted).await;
-    let _ = std::fs::remove_file(&temp_encrypted);
-    upload_result?;
+    let manifest_uuid =
+        make_manifest_s3_key(profile.s3_key_prefix.as_deref(), &uuid::Uuid::new_v4().to_string());
+    s3.upload_chunk(&manifest_uuid, encrypted).await?;
 
     // Insert DB records
     {
         let conn = db.conn()?;
         let manifest_id = db::insert_share_manifest(
-            &conn, profile.id, &manifest_uuid,
-            label.as_deref(), entries_with_filenames.len() as i64,
+            &conn,
+            profile.id,
+            &manifest_uuid,
+            label.as_deref(),
+            entries_with_filenames.len() as i64,
         )?;
-        for (entry, filename) in &entries_with_filenames {
+        for (entry, filename, _) in &entries_with_filenames {
             db::insert_share_manifest_entry(&conn, manifest_id, entry.id, filename)?;
         }
     }
@@ -421,29 +438,30 @@ pub async fn receive_manifest(
         get_active_profile_or_err(&conn)?
     };
 
-    let encryption_key = get_profile_encryption_key(&profile)?;
-    let temp_dir = get_temp_dir(&profile);
+    let key_hex = get_profile_encryption_key(&profile)?;
+    let key_bytes = crypto::decode_encryption_key(&key_hex)?;
     let s3 = build_s3_client(&profile).await?;
 
-    let temp_encrypted = crypto::generate_temp_path(&temp_dir);
-    let temp_decrypted = crypto::generate_temp_path(&temp_dir);
+    let encrypted = s3.download_chunk(&manifest_uuid).await?;
+    let manifest_bytes = crypto::decrypt_chunk(&key_bytes, &encrypted)?;
 
-    s3.download_object(&manifest_uuid, &temp_encrypted).await?;
-    crypto::decrypt_file(&temp_encrypted, &temp_decrypted, &encryption_key)?;
-    let _ = std::fs::remove_file(&temp_encrypted);
+    let manifest: ManifestJson = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| AppError::InvalidData(format!("Invalid manifest format: {}", e)))?;
 
-    let manifest_json = std::fs::read_to_string(&temp_decrypted)?;
-    let _ = std::fs::remove_file(&temp_decrypted);
-
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_json)?;
-    let files: Vec<ManifestFileEntry> = serde_json::from_value(
-        manifest.get("files").ok_or_else(|| AppError::InvalidData("manifest is missing 'files' key".into()))?.clone(),
-    )?;
+    let files: Vec<ManifestFileEntry> = manifest
+        .files
+        .into_iter()
+        .map(|f| ManifestFileEntry {
+            uuid: f.original_md5,
+            filename: f.filename,
+            size: f.total_size,
+        })
+        .collect();
 
     Ok(ManifestFileList { manifest_uuid, files })
 }
 
-/// Enqueue a manifest download. Returns the op ID immediately.
+/// Enqueue a manifest download. `selected_uuids` are `original_md5` values of the files to download.
 #[tauri::command]
 pub fn download_from_manifest(
     queue: State<'_, OperationQueue>,
@@ -475,20 +493,30 @@ pub fn list_share_manifests_cmd(db: State<DbState>) -> Result<Vec<db::ShareManif
 }
 
 #[tauri::command]
-pub fn get_share_manifest_files(db: State<DbState>, manifest_id: i64) -> Result<Vec<ManifestFileEntry>, AppError> {
+pub fn get_share_manifest_files(
+    db: State<DbState>,
+    manifest_id: i64,
+) -> Result<Vec<ManifestFileEntry>, AppError> {
     let conn = db.conn()?;
     let entries = db::list_share_manifest_entries(&conn, manifest_id)?;
     let mut files = Vec::new();
     for entry in entries {
-        if let Some(be) = db::get_backup_entry_by_id(&conn, entry.backup_entry_id)? {
-            files.push(ManifestFileEntry { uuid: be.object_uuid, filename: entry.filename, size: be.file_size });
+        if let Some(fe) = db::get_file_entry_by_id(&conn, entry.file_entry_id)? {
+            files.push(ManifestFileEntry {
+                uuid: fe.original_md5,
+                filename: entry.filename,
+                size: fe.total_size,
+            });
         }
     }
     Ok(files)
 }
 
 #[tauri::command]
-pub async fn revoke_share_manifest(db: State<'_, DbState>, manifest_id: i64) -> Result<(), AppError> {
+pub async fn revoke_share_manifest(
+    db: State<'_, DbState>,
+    manifest_id: i64,
+) -> Result<(), AppError> {
     let (profile, manifest) = {
         let conn = db.conn()?;
         let profile = get_active_profile_or_err(&conn)?;
@@ -509,7 +537,6 @@ pub async fn revoke_share_manifest(db: State<'_, DbState>, manifest_id: i64) -> 
 // Phase 8: Scramble
 // ══════════════════════════════════════════════════════
 
-/// Enqueue a scramble operation. Returns the op ID immediately.
 #[tauri::command]
 pub fn scramble(
     queue: State<'_, OperationQueue>,
@@ -520,7 +547,11 @@ pub fn scramble(
         "Scrambling all files".into()
     } else {
         let count = backup_entry_ids.len();
-        if count == 1 { "Scrambling 1 file".into() } else { format!("Scrambling {} files", count) }
+        if count == 1 {
+            "Scrambling 1 file".into()
+        } else {
+            format!("Scrambling {} files", count)
+        }
     };
     let id = queue.enqueue(label, "scramble", OpParams::Scramble { backup_entry_ids, scramble_all });
     Ok(id)
@@ -533,7 +564,7 @@ pub fn scramble(
 #[derive(Debug, serde::Serialize)]
 pub struct OrphanedLocalEntry {
     pub local_file_id: i64,
-    pub backup_entry_id: i64,
+    pub file_entry_id: i64,
     pub local_path: String,
 }
 
@@ -543,29 +574,33 @@ pub struct OrphanedS3Object {
     pub size: i64,
 }
 
-
 #[tauri::command]
-pub fn scan_orphaned_local_entries(db: State<DbState>) -> Result<Vec<OrphanedLocalEntry>, AppError> {
+pub fn scan_orphaned_local_entries(
+    db: State<DbState>,
+) -> Result<Vec<OrphanedLocalEntry>, AppError> {
     let conn = db.conn()?;
     let profile = get_active_profile_or_err(&conn)?;
 
     let mut stmt = conn.prepare(
-        "SELECT lf.id, lf.backup_entry_id, lf.local_path
-         FROM local_file lf JOIN backup_entry be ON lf.backup_entry_id = be.id
-         WHERE be.profile_id = ?1",
+        "SELECT lf.id, lf.file_entry_id, lf.local_path
+         FROM local_file lf
+         JOIN file_entry fe ON lf.file_entry_id = fe.id
+         WHERE fe.profile_id = ?1",
     )?;
 
-    let rows = stmt.query_map(rusqlite::params![profile.id], |row: &rusqlite::Row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-    })?.collect::<Result<Vec<(i64, i64, String)>, _>>()?;
+    let rows = stmt
+        .query_map(rusqlite::params![profile.id], |row: &rusqlite::Row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+        })?
+        .collect::<Result<Vec<(i64, i64, String)>, _>>()?;
 
     let mut orphans = Vec::new();
-    for (lf_id, be_id, local_path) in &rows {
+    for (lf_id, fe_id, local_path) in &rows {
         let full_path = backup::expand_relative_path(local_path, profile.relative_path.as_deref());
         if !full_path.exists() {
             orphans.push(OrphanedLocalEntry {
                 local_file_id: *lf_id,
-                backup_entry_id: *be_id,
+                file_entry_id: *fe_id,
                 local_path: local_path.to_string(),
             });
         }
@@ -573,7 +608,6 @@ pub fn scan_orphaned_local_entries(db: State<DbState>) -> Result<Vec<OrphanedLoc
     Ok(orphans)
 }
 
-/// Enqueue a local orphan cleanup. Returns the op ID immediately.
 #[tauri::command]
 pub fn cleanup_orphaned_local_entries(
     queue: State<'_, OperationQueue>,
@@ -596,29 +630,31 @@ pub fn cleanup_orphaned_local_entries(
 }
 
 #[tauri::command]
-pub async fn scan_orphaned_s3_objects(db: State<'_, DbState>) -> Result<Vec<OrphanedS3Object>, AppError> {
-    let (profile, known_uuids) = {
+pub async fn scan_orphaned_s3_objects(
+    db: State<'_, DbState>,
+) -> Result<Vec<OrphanedS3Object>, AppError> {
+    let (profile, known_keys) = {
         let conn = db.conn()?;
         let profile = get_active_profile_or_err(&conn)?;
-        let mut uuids = std::collections::HashSet::new();
-        for e in db::list_backup_entries(&conn, profile.id)? {
-            uuids.insert(e.object_uuid);
+        let mut keys = std::collections::HashSet::new();
+        for chunk in db::list_chunks(&conn, profile.id)? {
+            keys.insert(chunk.s3_key);
         }
-        for m in db::list_share_manifests(&conn, profile.id)? {
-            uuids.insert(m.manifest_uuid);
+        for manifest in db::list_share_manifests(&conn, profile.id)? {
+            keys.insert(manifest.manifest_uuid);
         }
-        (profile, uuids)
+        (profile, keys)
     };
 
     let s3 = build_s3_client(&profile).await?;
     let objects = s3.list_objects(profile.s3_key_prefix.as_deref()).await?;
-    Ok(objects.into_iter()
-        .filter(|obj| !known_uuids.contains(&obj.key))
+    Ok(objects
+        .into_iter()
+        .filter(|obj| !known_keys.contains(&obj.key))
         .map(|obj| OrphanedS3Object { key: obj.key, size: obj.size })
         .collect())
 }
 
-/// Enqueue an S3 orphan cleanup. Returns the op ID immediately.
 #[tauri::command]
 pub fn cleanup_orphaned_s3_objects(
     queue: State<'_, OperationQueue>,
@@ -643,8 +679,6 @@ pub fn cleanup_orphaned_s3_objects(
 // Phase 10: Integrity Verification
 // ══════════════════════════════════════════════════════
 
-/// Enqueue an integrity verification. Returns the op ID immediately.
-/// Results are delivered via the `verify:complete` event.
 #[tauri::command]
 pub fn verify_integrity(
     queue: State<'_, OperationQueue>,
@@ -668,38 +702,58 @@ pub fn verify_integrity(
 struct DatabaseExport {
     version: i32,
     profiles: Vec<db::Profile>,
-    backup_entries: Vec<db::BackupEntry>,
+    file_entries: Vec<db::FileEntry>,
+    chunks: Vec<db::Chunk>,
+    local_files: Vec<db::LocalFile>,
     share_manifests: Vec<db::ShareManifest>,
     share_manifest_entries: Vec<db::ShareManifestEntry>,
-    local_files: Vec<db::LocalFile>,
 }
 
 #[tauri::command]
 pub fn export_database(db: State<DbState>, file_path: String) -> Result<(), AppError> {
     let conn = db.conn()?;
     let profiles = db::list_profiles(&conn)?;
-    let mut all_entries = Vec::new();
-    let mut all_manifests = Vec::new();
-    let mut all_manifest_entries = Vec::new();
-    let mut all_local_files = Vec::new();
+    let mut file_entries = Vec::new();
+    let mut chunks = Vec::new();
+    let mut local_files = Vec::new();
+    let mut share_manifests = Vec::new();
+    let mut share_manifest_entries = Vec::new();
 
     for profile in &profiles {
-        let entries = db::list_backup_entries(&conn, profile.id)?;
-        for entry in &entries {
-            all_local_files.extend(db::list_local_files(&conn, entry.id)?);
-        }
-        all_entries.extend(entries);
+        file_entries.extend(db::list_file_entries(&conn, profile.id)?);
+        chunks.extend(db::list_chunks(&conn, profile.id)?);
         let manifests = db::list_share_manifests(&conn, profile.id)?;
         for manifest in &manifests {
-            all_manifest_entries.extend(db::list_share_manifest_entries(&conn, manifest.id)?);
+            share_manifest_entries.extend(db::list_share_manifest_entries(&conn, manifest.id)?);
         }
-        all_manifests.extend(manifests);
+        share_manifests.extend(manifests);
     }
+    // local_file is globally unique, query all
+    let mut stmt = conn.prepare(
+        "SELECT id, file_entry_id, local_path, cached_mtime, cached_size, updated_at FROM local_file",
+    )?;
+    local_files.extend(
+        stmt.query_map([], |row| {
+            Ok(db::LocalFile {
+                id: row.get(0)?,
+                file_entry_id: row.get(1)?,
+                local_path: row.get(2)?,
+                cached_mtime: row.get(3)?,
+                cached_size: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?,
+    );
 
     let export = DatabaseExport {
-        version: 1, profiles, backup_entries: all_entries,
-        share_manifests: all_manifests, share_manifest_entries: all_manifest_entries,
-        local_files: all_local_files,
+        version: 5,
+        profiles,
+        file_entries,
+        chunks,
+        local_files,
+        share_manifests,
+        share_manifest_entries,
     };
     std::fs::write(&file_path, serde_json::to_string_pretty(&export)?)?;
     Ok(())
@@ -708,24 +762,37 @@ pub fn export_database(db: State<DbState>, file_path: String) -> Result<(), AppE
 #[tauri::command]
 pub fn import_database(db: State<DbState>, file_path: String) -> Result<(), AppError> {
     let json = std::fs::read_to_string(&file_path)?;
-    let import: DatabaseExport = serde_json::from_str(&json)?;
+    let import: DatabaseExport = serde_json::from_str(&json)
+        .map_err(|e| AppError::InvalidData(format!("Invalid database export: {}", e)))?;
     let conn = db.conn()?;
 
     conn.execute_batch(
-        "DELETE FROM share_manifest_entry; DELETE FROM local_file;
-         DELETE FROM share_manifest; DELETE FROM backup_entry; DELETE FROM profile;",
+        "DELETE FROM share_manifest_entry;
+         DELETE FROM local_file;
+         DELETE FROM file_chunk;
+         DELETE FROM share_manifest;
+         DELETE FROM chunk;
+         DELETE FROM file_entry;
+         DELETE FROM profile;",
     )?;
 
     for p in &import.profiles {
         conn.execute(
-            "INSERT INTO profile (id,name,mode,s3_endpoint,s3_region,s3_bucket,extra_env,relative_path,temp_directory,is_active,created_at,s3_key_prefix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-            rusqlite::params![p.id,p.name,p.mode,p.s3_endpoint,p.s3_region,p.s3_bucket,p.extra_env,p.relative_path,p.temp_directory,p.is_active,p.created_at,p.s3_key_prefix],
+            "INSERT INTO profile (id,name,mode,s3_endpoint,s3_region,s3_bucket,extra_env,relative_path,temp_directory,is_active,created_at,s3_key_prefix,chunk_size_bytes)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![p.id,p.name,p.mode,p.s3_endpoint,p.s3_region,p.s3_bucket,p.extra_env,p.relative_path,p.temp_directory,p.is_active,p.created_at,p.s3_key_prefix,p.chunk_size_bytes],
         )?;
     }
-    for e in &import.backup_entries {
+    for e in &import.file_entries {
         conn.execute(
-            "INSERT INTO backup_entry (id,profile_id,object_uuid,original_md5,encrypted_md5,file_size,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            rusqlite::params![e.id,e.profile_id,e.object_uuid,e.original_md5,e.encrypted_md5,e.file_size,e.created_at],
+            "INSERT INTO file_entry (id,profile_id,original_md5,total_size,chunk_count,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![e.id,e.profile_id,e.original_md5,e.total_size,e.chunk_count,e.created_at],
+        )?;
+    }
+    for c in &import.chunks {
+        conn.execute(
+            "INSERT INTO chunk (id,profile_id,chunk_hash,s3_key,encrypted_size,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![c.id,c.profile_id,c.chunk_hash,c.s3_key,c.encrypted_size,c.created_at],
         )?;
     }
     for m in &import.share_manifests {
@@ -736,14 +803,14 @@ pub fn import_database(db: State<DbState>, file_path: String) -> Result<(), AppE
     }
     for e in &import.share_manifest_entries {
         conn.execute(
-            "INSERT INTO share_manifest_entry (id,share_manifest_id,backup_entry_id,filename) VALUES (?1,?2,?3,?4)",
-            rusqlite::params![e.id,e.share_manifest_id,e.backup_entry_id,e.filename],
+            "INSERT INTO share_manifest_entry (id,share_manifest_id,file_entry_id,filename) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![e.id,e.share_manifest_id,e.file_entry_id,e.filename],
         )?;
     }
     for f in &import.local_files {
         conn.execute(
-            "INSERT INTO local_file (id,backup_entry_id,local_path,cached_mtime,cached_size,updated_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![f.id,f.backup_entry_id,f.local_path,f.cached_mtime,f.cached_size,f.updated_at],
+            "INSERT INTO local_file (id,file_entry_id,local_path,cached_mtime,cached_size,updated_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![f.id,f.file_entry_id,f.local_path,f.cached_mtime,f.cached_size,f.updated_at],
         )?;
     }
     Ok(())
@@ -753,8 +820,6 @@ pub fn import_database(db: State<DbState>, file_path: String) -> Result<(), AppE
 // Phase 12: Profile Config Export / Import
 // ══════════════════════════════════════════════════════
 
-/// Serializable snapshot of a profile's connection config, excluding the encryption key.
-/// Written to disk during export; read back during import.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProfileConfigExport {
     pub name: String,
@@ -768,11 +833,9 @@ pub struct ProfileConfigExport {
     pub relative_path: Option<String>,
     pub temp_directory: Option<String>,
     pub s3_key_prefix: Option<String>,
-    pub upload_chunk_size_mb: Option<i64>,
+    pub chunk_size_bytes: i64,
 }
 
-/// Export a profile's connection config (including S3 credentials) to a JSON file.
-/// The encryption key is intentionally omitted; the recipient must supply it at import time.
 #[tauri::command]
 pub fn export_profile_config(
     db: State<DbState>,
@@ -796,17 +859,12 @@ pub fn export_profile_config(
         relative_path: profile.relative_path,
         temp_directory: profile.temp_directory,
         s3_key_prefix: profile.s3_key_prefix,
-        upload_chunk_size_mb: profile.upload_chunk_size_mb,
+        chunk_size_bytes: profile.chunk_size_bytes,
     };
-    let json = serde_json::to_string_pretty(&export)?;
-    std::fs::write(&file_path, json)?;
+    std::fs::write(&file_path, serde_json::to_string_pretty(&export)?)?;
     Ok(())
 }
 
-/// Import a profile from a previously exported JSON file.
-/// `mode_override` lets the importer choose "read-only" or "read-write" regardless of what the
-/// exporter had. If `None`, the mode stored in the file is used.
-/// The encryption key must be supplied separately — it is never stored in the export file.
 #[tauri::command]
 pub fn import_profile_config(
     db: State<DbState>,
@@ -833,7 +891,7 @@ pub fn import_profile_config(
         cfg.temp_directory.as_deref(),
         Some(&encryption_key),
         cfg.s3_key_prefix.as_deref(),
-        cfg.upload_chunk_size_mb,
+        Some(cfg.chunk_size_bytes),
     )
 }
 
@@ -841,6 +899,7 @@ pub fn import_profile_config(
 // File browser
 // ══════════════════════════════════════════════════════
 
+/// Frontend-facing file entry. `object_uuid` is set to `original_md5` for compatibility.
 #[derive(Debug, serde::Serialize)]
 pub struct FileEntry {
     pub id: i64,
@@ -858,13 +917,13 @@ pub fn list_files(db: State<DbState>, search: Option<String>) -> Result<Vec<File
     let profile = get_active_profile_or_err(&conn)?;
 
     let query = if search.is_some() {
-        "SELECT be.id, be.object_uuid, lf.local_path, be.file_size, be.original_md5, be.created_at
-         FROM backup_entry be JOIN local_file lf ON lf.backup_entry_id = be.id
-         WHERE be.profile_id = ?1 AND lf.local_path LIKE ?2 ORDER BY lf.local_path"
+        "SELECT fe.id, fe.original_md5, lf.local_path, fe.total_size, fe.original_md5, fe.created_at
+         FROM file_entry fe JOIN local_file lf ON lf.file_entry_id = fe.id
+         WHERE fe.profile_id = ?1 AND lf.local_path LIKE ?2 ORDER BY lf.local_path"
     } else {
-        "SELECT be.id, be.object_uuid, lf.local_path, be.file_size, be.original_md5, be.created_at
-         FROM backup_entry be JOIN local_file lf ON lf.backup_entry_id = be.id
-         WHERE be.profile_id = ?1 ORDER BY lf.local_path"
+        "SELECT fe.id, fe.original_md5, lf.local_path, fe.total_size, fe.original_md5, fe.created_at
+         FROM file_entry fe JOIN local_file lf ON lf.file_entry_id = fe.id
+         WHERE fe.profile_id = ?1 ORDER BY lf.local_path"
     };
 
     let mut stmt = conn.prepare(query)?;
@@ -872,12 +931,18 @@ pub fn list_files(db: State<DbState>, search: Option<String>) -> Result<Vec<File
 
     let map_row = |row: &rusqlite::Row| -> rusqlite::Result<FileEntry> {
         let local_path: String = row.get(2)?;
-        let filename = Path::new(&local_path).file_name()
+        let filename = Path::new(&local_path)
+            .file_name()
             .map(|f| f.to_string_lossy().to_string())
             .unwrap_or_else(|| local_path.clone());
         Ok(FileEntry {
-            id: row.get(0)?, object_uuid: row.get(1)?, filename, local_path,
-            file_size: row.get(3)?, original_md5: row.get(4)?, created_at: row.get(5)?,
+            id: row.get(0)?,
+            object_uuid: row.get(1)?, // original_md5 used as uuid
+            filename,
+            local_path,
+            file_size: row.get(3)?,
+            original_md5: row.get(4)?,
+            created_at: row.get(5)?,
         })
     };
 
@@ -892,6 +957,8 @@ pub fn list_files(db: State<DbState>, search: Option<String>) -> Result<Vec<File
     Ok(rows)
 }
 
+/// Delete file_entries (and associated chunks that become orphaned). Frontend calls this
+/// `delete_backup_entries` for API compatibility.
 #[tauri::command]
 pub async fn delete_backup_entries(
     db: State<'_, DbState>,
@@ -902,7 +969,7 @@ pub async fn delete_backup_entries(
         let profile = get_active_profile_or_err(&conn)?;
         let mut entries = Vec::new();
         for id in &backup_entry_ids {
-            if let Some(e) = db::get_backup_entry_by_id(&conn, *id)? {
+            if let Some(e) = db::get_file_entry_by_id(&conn, *id)? {
                 entries.push(e);
             }
         }
@@ -913,11 +980,49 @@ pub async fn delete_backup_entries(
     let mut deleted = 0;
 
     for entry in &entries {
-        s3.delete_object(&entry.object_uuid).await.ok();
-        let conn = db.conn()?;
-        conn.execute("DELETE FROM share_manifest_entry WHERE backup_entry_id = ?1", rusqlite::params![entry.id])?;
-        conn.execute("DELETE FROM local_file WHERE backup_entry_id = ?1", rusqlite::params![entry.id])?;
-        db::delete_backup_entry(&conn, entry.id)?;
+        // Collect chunk IDs referenced by this file_entry before deleting file_chunk rows
+        let chunk_ids: Vec<i64> = {
+            let conn = db.conn()?;
+            db::get_chunk_ids_for_file(&conn, entry.id)?
+        };
+
+        // Remove share_manifest_entry rows that reference this file_entry
+        {
+            let conn = db.conn()?;
+            conn.execute(
+                "DELETE FROM share_manifest_entry WHERE file_entry_id = ?1",
+                rusqlite::params![entry.id],
+            )?;
+            conn.execute(
+                "DELETE FROM file_chunk WHERE file_entry_id = ?1",
+                rusqlite::params![entry.id],
+            )?;
+            conn.execute(
+                "DELETE FROM local_file WHERE file_entry_id = ?1",
+                rusqlite::params![entry.id],
+            )?;
+            db::delete_file_entry(&conn, entry.id)?;
+        }
+
+        // Delete chunks that are now orphaned (not referenced by any remaining file_entry)
+        for chunk_id in &chunk_ids {
+            let ref_count = {
+                let conn = db.conn()?;
+                db::count_file_entries_for_chunk(&conn, *chunk_id)?
+            };
+            if ref_count == 0 {
+                let chunk = {
+                    let conn = db.conn()?;
+                    db::get_chunk_by_id(&conn, *chunk_id)?
+                };
+                if let Some(c) = chunk {
+                    s3.delete_object(&c.s3_key).await.ok();
+                    let conn = db.conn()?;
+                    db::delete_chunk(&conn, *chunk_id)?;
+                }
+            }
+        }
+
         deleted += 1;
     }
 
@@ -928,15 +1033,11 @@ pub async fn delete_backup_entries(
 // Config
 // ══════════════════════════════════════════════════════
 
-/// Return the current app configuration.
 #[tauri::command]
 pub fn get_config() -> Result<crate::config::AppConfig, AppError> {
     crate::config::load_or_create_config()
 }
 
-/// Change the database file path saved in config.json.
-/// If `copy_existing` is true and the current database file exists, it is
-/// copied to the new location first. The change takes effect on next launch.
 #[tauri::command]
 pub fn set_database_path(new_path: String, copy_existing: bool) -> Result<(), AppError> {
     let current = crate::config::load_or_create_config()?;
@@ -959,6 +1060,7 @@ pub fn set_database_path(new_path: String, copy_existing: bool) -> Result<(), Ap
     Ok(())
 }
 
+// ══════════════════════════════════════════════════════
 // Throttle
 // ══════════════════════════════════════════════════════
 
@@ -968,8 +1070,6 @@ pub struct ThrottleLimits {
     pub download_bps: u64,
 }
 
-/// Update the global upload and/or download rate limits.
-/// Pass 0 for unlimited.
 #[tauri::command]
 pub fn set_throttle_limits(
     upload_bps: u64,
@@ -981,7 +1081,6 @@ pub fn set_throttle_limits(
     Ok(())
 }
 
-/// Get the current upload and download rate limits.
 #[tauri::command]
 pub fn get_throttle_limits(
     throttle: State<crate::throttle::ThrottleState>,

@@ -10,7 +10,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 rustup update stable
 ```
 
-**Node.js 20+** — via [nvm](https://github.com/nvm-sh/nvm) or direct install.
+**Node.js 22 LTS** — via [nvm](https://github.com/nvm-sh/nvm): `nvm install` (reads `.nvmrc`).
 
 **Linux system deps:**
 ```bash
@@ -45,6 +45,9 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 # Rust linting
 cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
+
+# Frontend unit tests
+npm test
 
 # Frontend type-check
 npm run check

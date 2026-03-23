@@ -203,10 +203,20 @@ describe('operationsStore — progress / file log', () => {
     expect(op2?.pendingFiles).toHaveLength(0); // unaffected (covers `: o` else-branch)
   });
 
-  it('progress removes current file from pendingFiles', () => {
-    emit('op:pending_files', { op_id: 'op1', files: ['a.txt', 'b.txt'] });
+  it('progress removes current file from pendingFiles (exact match on full path)', () => {
+    emit('op:pending_files', { op_id: 'op1', files: ['/path/a.txt', '/path/b.txt'] });
     emit('backup:progress', { op_id: 'op1', processed: 1, total: 2, current_file: '/path/a.txt' });
-    expect(operationsStore.list[0].pendingFiles).toEqual(['b.txt']);
+    expect(operationsStore.list[0].pendingFiles).toEqual(['/path/b.txt']);
+  });
+
+  it('progress removes correct file when two files share a basename', () => {
+    emit('op:pending_files', { op_id: 'op1', files: ['/dir1/utils.ts', '/dir2/utils.ts'] });
+    emit('backup:progress', { op_id: 'op1', processed: 1, total: 2, current_file: '/dir1/utils.ts' });
+    // Only /dir1/utils.ts removed; /dir2/utils.ts must remain
+    expect(operationsStore.list[0].pendingFiles).toEqual(['/dir2/utils.ts']);
+    // file log still shows the basename
+    const activeFile = operationsStore.list[0].files.find((f) => f.status === 'active');
+    expect(activeFile?.name).toBe('utils.ts');
   });
 
   it('restore:progress updates progress', () => {
