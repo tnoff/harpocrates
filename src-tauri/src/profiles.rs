@@ -2,8 +2,12 @@ use rand::RngExt;
 use rusqlite::Connection;
 
 use crate::credentials;
+use crate::crypto;
 use crate::db;
 use crate::error::AppError;
+
+/// Default chunk size (10 MiB).
+pub const DEFAULT_CHUNK_SIZE_BYTES: i64 = 10 * 1024 * 1024;
 
 #[derive(Debug, serde::Serialize)]
 pub struct CreateProfileResult {
@@ -58,9 +62,8 @@ pub fn create_profile(
     temp_directory: Option<&str>,
     import_encryption_key: Option<&str>,
     s3_key_prefix: Option<&str>,
-    upload_chunk_size_mb: Option<i64>,
+    chunk_size_bytes: Option<i64>,
 ) -> Result<CreateProfileResult, AppError> {
-    // Validate mode
     if mode != "read-write" && mode != "read-only" {
         return Err(AppError::Config(format!(
             "Invalid profile mode '{}'. Must be 'read-write' or 'read-only'.",
@@ -73,7 +76,8 @@ pub fn create_profile(
         None => None,
     };
 
-    // Insert profile into DB (UNIQUE constraint on endpoint+bucket will catch duplicates)
+    let effective_chunk_size = chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
+
     let profile_id = db::insert_profile(
         conn,
         name,
@@ -85,16 +89,26 @@ pub fn create_profile(
         relative_path,
         temp_directory,
         validated_prefix.as_deref(),
-        upload_chunk_size_mb,
+        effective_chunk_size,
     )?;
 
-    // Generate or import encryption key
     let encryption_key = match import_encryption_key {
-        Some(key) => key.to_string(),
+        Some(key) => {
+            let key = key.trim();
+            if key.is_empty() {
+                generate_encryption_key()
+            } else if crypto::decode_encryption_key(key).is_ok() {
+                // Already a valid 64-char hex key — use it directly.
+                key.to_string()
+            } else {
+                // Treat as a passphrase: SHA-256 → 32 bytes → hex.
+                // Deterministic: the same passphrase always produces the same key.
+                hex::encode(crypto::derive_key_from_passphrase(key))
+            }
+        }
         None => generate_encryption_key(),
     };
 
-    // Store credentials in keychain
     credentials::store_s3_access_key(name, s3_access_key)?;
     credentials::store_s3_secret_key(name, s3_secret_key)?;
     credentials::store_encryption_key(name, &encryption_key)?;
@@ -123,7 +137,6 @@ pub fn switch_profile(conn: &Connection, profile_id: i64) -> Result<db::Profile,
     db::get_profile_by_id(conn, profile_id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", profile_id)))?;
     db::set_active_profile(conn, profile_id)?;
-    // Return refreshed profile
     db::get_profile_by_id(conn, profile_id)?
         .ok_or_else(|| AppError::NotFound("profile not found after switch".into()))
 }
@@ -143,7 +156,7 @@ pub fn update_profile(
     relative_path: Option<Option<&str>>,
     temp_directory: Option<Option<&str>>,
     s3_key_prefix: Option<Option<&str>>,
-    upload_chunk_size_mb: Option<Option<i64>>,
+    chunk_size_bytes: Option<i64>,
 ) -> Result<db::Profile, AppError> {
     let existing = db::get_profile_by_id(conn, id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", id)))?;
@@ -182,26 +195,25 @@ pub fn update_profile(
         Some(None) => None,
         None => existing.s3_key_prefix.clone(),
     };
-    let new_upload_chunk_size_mb = match upload_chunk_size_mb {
-        Some(v) => v,
-        None => existing.upload_chunk_size_mb,
-    };
+    let new_chunk_size_bytes = chunk_size_bytes.unwrap_or(existing.chunk_size_bytes);
 
     conn.execute(
-        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5, extra_env=?6, relative_path=?7, temp_directory=?8, s3_key_prefix=?9, upload_chunk_size_mb=?10 WHERE id=?11",
-        rusqlite::params![new_name, new_mode, new_endpoint, new_region, new_bucket, new_extra_env, new_relative_path, new_temp_directory, new_s3_key_prefix, new_upload_chunk_size_mb, id],
+        "UPDATE profile SET name=?1, mode=?2, s3_endpoint=?3, s3_region=?4, s3_bucket=?5,
+         extra_env=?6, relative_path=?7, temp_directory=?8, s3_key_prefix=?9,
+         chunk_size_bytes=?10 WHERE id=?11",
+        rusqlite::params![
+            new_name, new_mode, new_endpoint, new_region, new_bucket,
+            new_extra_env, new_relative_path, new_temp_directory, new_s3_key_prefix,
+            new_chunk_size_bytes, id
+        ],
     )?;
 
     // Update keychain credentials if changed
     if let Some(access_key) = s3_access_key {
-        // If profile name changed, delete old credentials and store under new name
         if name.is_some() && new_name != existing.name {
             credentials::delete_all_credentials(&existing.name)?;
-            // Re-store all credentials under new name
-            let secret = credentials::get_s3_secret_key(&existing.name)
-                .unwrap_or_default();
-            let enc_key = credentials::get_encryption_key(&existing.name)
-                .unwrap_or_default();
+            let secret = credentials::get_s3_secret_key(&existing.name).unwrap_or_default();
+            let enc_key = credentials::get_encryption_key(&existing.name).unwrap_or_default();
             credentials::store_s3_access_key(new_name, access_key)?;
             if !secret.is_empty() {
                 credentials::store_s3_secret_key(new_name, &secret)?;
@@ -220,7 +232,6 @@ pub fn update_profile(
     // If only the name changed (no explicit credential updates), migrate credentials
     if let Some(nn) = name {
         if nn != existing.name && s3_access_key.is_none() {
-            // Migrate all credentials from old name to new name
             if let Ok(ak) = credentials::get_s3_access_key(&existing.name) {
                 credentials::store_s3_access_key(nn, &ak)?;
             }
@@ -242,28 +253,43 @@ pub fn delete_profile(conn: &Connection, id: i64) -> Result<(), AppError> {
     let profile = db::get_profile_by_id(conn, id)?
         .ok_or_else(|| AppError::Config(format!("Profile with id {} not found", id)))?;
 
-    // Delete all related data (share_manifest_entries, local_files, backup_entries, share_manifests)
+    // Cascade delete in dependency order:
+    // 1. share_manifest_entry → share_manifest → (for this profile)
     conn.execute(
-        "DELETE FROM share_manifest_entry WHERE share_manifest_id IN (SELECT id FROM share_manifest WHERE profile_id = ?1)",
+        "DELETE FROM share_manifest_entry WHERE share_manifest_id IN
+         (SELECT id FROM share_manifest WHERE profile_id = ?1)",
         rusqlite::params![id],
     )?;
+    // 2. local_file → file_entry (for this profile)
     conn.execute(
-        "DELETE FROM local_file WHERE backup_entry_id IN (SELECT id FROM backup_entry WHERE profile_id = ?1)",
+        "DELETE FROM local_file WHERE file_entry_id IN
+         (SELECT id FROM file_entry WHERE profile_id = ?1)",
         rusqlite::params![id],
     )?;
+    // 3. file_chunk → file_entry (for this profile)
+    conn.execute(
+        "DELETE FROM file_chunk WHERE file_entry_id IN
+         (SELECT id FROM file_entry WHERE profile_id = ?1)",
+        rusqlite::params![id],
+    )?;
+    // 4. share_manifest
     conn.execute(
         "DELETE FROM share_manifest WHERE profile_id = ?1",
         rusqlite::params![id],
     )?;
+    // 5. chunk (profile-scoped)
     conn.execute(
-        "DELETE FROM backup_entry WHERE profile_id = ?1",
+        "DELETE FROM chunk WHERE profile_id = ?1",
         rusqlite::params![id],
     )?;
+    // 6. file_entry
+    conn.execute(
+        "DELETE FROM file_entry WHERE profile_id = ?1",
+        rusqlite::params![id],
+    )?;
+
     db::delete_profile(conn, id)?;
-
-    // Remove keychain entries
     credentials::delete_all_credentials(&profile.name)?;
-
     Ok(())
 }
 
@@ -274,7 +300,6 @@ mod tests {
     #[test]
     fn test_generate_encryption_key_length() {
         let key = generate_encryption_key();
-        // 32 bytes = 64 hex characters
         assert_eq!(key.len(), 64);
     }
 
@@ -291,81 +316,21 @@ mod tests {
         assert_ne!(key1, key2);
     }
 
-    fn setup_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS profile (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'read-write',
-                s3_endpoint TEXT NOT NULL,
-                s3_region TEXT,
-                s3_bucket TEXT NOT NULL,
-                extra_env TEXT,
-                relative_path TEXT,
-                temp_directory TEXT,
-                s3_key_prefix TEXT,
-                upload_chunk_size_mb INTEGER,
-                is_active BOOLEAN NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(s3_endpoint, s3_bucket)
-            );
-            CREATE TABLE IF NOT EXISTS backup_entry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                profile_id INTEGER NOT NULL REFERENCES profile(id),
-                object_uuid TEXT NOT NULL,
-                original_md5 TEXT NOT NULL,
-                encrypted_md5 TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(profile_id, object_uuid)
-            );
-            CREATE TABLE IF NOT EXISTS share_manifest (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                profile_id INTEGER NOT NULL REFERENCES profile(id),
-                manifest_uuid TEXT NOT NULL,
-                label TEXT,
-                file_count INTEGER NOT NULL,
-                is_valid BOOLEAN NOT NULL DEFAULT 1,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(profile_id, manifest_uuid)
-            );
-            CREATE TABLE IF NOT EXISTS share_manifest_entry (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                share_manifest_id INTEGER NOT NULL REFERENCES share_manifest(id),
-                backup_entry_id INTEGER NOT NULL REFERENCES backup_entry(id),
-                filename TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS local_file (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                backup_entry_id INTEGER NOT NULL REFERENCES backup_entry(id),
-                local_path TEXT NOT NULL,
-                cached_mtime REAL,
-                cached_size INTEGER,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(backup_entry_id, local_path)
-            );
-            ",
-        )
-        .unwrap();
-        conn
-    }
-
     #[test]
     fn test_get_active_profile_none() {
-        let conn = setup_db();
+        let conn = db::open_test_db();
         let result = get_active_profile(&conn).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_get_active_profile_found() {
-        let conn = setup_db();
+        let conn = db::open_test_db();
         let id = db::insert_profile(
-            &conn, "test", "read-write", "https://s3.test.com", None, "bucket", None, None, None, None, None,
-        ).unwrap();
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
+            None, None, None, None, DEFAULT_CHUNK_SIZE_BYTES,
+        )
+        .unwrap();
         db::set_active_profile(&conn, id).unwrap();
         let result = get_active_profile(&conn).unwrap();
         assert!(result.is_some());
@@ -374,13 +339,17 @@ mod tests {
 
     #[test]
     fn test_switch_profile() {
-        let conn = setup_db();
+        let conn = db::open_test_db();
         let id1 = db::insert_profile(
-            &conn, "p1", "read-write", "https://a.com", None, "b1", None, None, None, None, None,
-        ).unwrap();
+            &conn, "p1", "read-write", "https://a.com", None, "b1",
+            None, None, None, None, DEFAULT_CHUNK_SIZE_BYTES,
+        )
+        .unwrap();
         let id2 = db::insert_profile(
-            &conn, "p2", "read-write", "https://b.com", None, "b2", None, None, None, None, None,
-        ).unwrap();
+            &conn, "p2", "read-write", "https://b.com", None, "b2",
+            None, None, None, None, DEFAULT_CHUNK_SIZE_BYTES,
+        )
+        .unwrap();
 
         let profile = switch_profile(&conn, id1).unwrap();
         assert_eq!(profile.name, "p1");
@@ -390,14 +359,13 @@ mod tests {
         assert_eq!(profile.name, "p2");
         assert!(profile.is_active);
 
-        // p1 should no longer be active
         let p1 = db::get_profile_by_id(&conn, id1).unwrap().unwrap();
         assert!(!p1.is_active);
     }
 
     #[test]
     fn test_switch_profile_nonexistent() {
-        let conn = setup_db();
+        let conn = db::open_test_db();
         let result = switch_profile(&conn, 999);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not found"));
@@ -405,7 +373,7 @@ mod tests {
 
     #[test]
     fn test_create_profile_invalid_mode() {
-        let conn = setup_db();
+        let conn = db::open_test_db();
         let result = create_profile(
             &conn, "test", "invalid-mode", "https://s3.test.com", None, "bucket",
             "ak", "sk", None, None, None, None, None, None,
@@ -414,11 +382,57 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Invalid profile mode"));
     }
 
-    // ── validate_s3_key_prefix tests ──
+    #[test]
+    fn test_create_profile_accepts_valid_hex_import_key() {
+        let conn = db::open_test_db();
+        let valid_key = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+        let result = create_profile(
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
+            "ak", "sk", None, None, None, Some(valid_key), None, None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().encryption_key, valid_key);
+    }
+
+    #[test]
+    fn test_create_profile_derives_key_from_passphrase() {
+        let conn = db::open_test_db();
+        let result = create_profile(
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
+            "ak", "sk", None, None, None, Some("my-memorable-passphrase"), None, None,
+        );
+        let key = result.unwrap().encryption_key;
+        // Derived key must be a valid 64-char hex string.
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        // Same passphrase must produce the same key.
+        let conn2 = db::open_test_db();
+        let result2 = create_profile(
+            &conn2, "test2", "read-write", "https://s3.test.com", None, "bucket",
+            "ak", "sk", None, None, None, Some("my-memorable-passphrase"), None, None,
+        );
+        assert_eq!(result2.unwrap().encryption_key, key);
+    }
+
+    #[test]
+    fn test_create_profile_passphrase_trims_whitespace() {
+        let conn = db::open_test_db();
+        let result = create_profile(
+            &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
+            "ak", "sk", None, None, None, Some("  my-passphrase  "), None, None,
+        );
+        let conn2 = db::open_test_db();
+        let result2 = create_profile(
+            &conn2, "test2", "read-write", "https://s3.test.com", None, "bucket",
+            "ak", "sk", None, None, None, Some("my-passphrase"), None, None,
+        );
+        assert_eq!(result.unwrap().encryption_key, result2.unwrap().encryption_key);
+    }
+
+    // ── validate_s3_key_prefix ────────────────────────────────────────────────
 
     #[test]
     fn test_validate_prefix_none_input() {
-        // None = no prefix wanted, always fine
         assert_eq!(validate_s3_key_prefix("").unwrap(), None);
         assert_eq!(validate_s3_key_prefix("   ").unwrap(), None);
     }
@@ -477,5 +491,10 @@ mod tests {
         let result = validate_s3_key_prefix("foo\x01bar");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("invalid characters"));
+    }
+
+    #[test]
+    fn test_default_chunk_size_is_10_mib() {
+        assert_eq!(DEFAULT_CHUNK_SIZE_BYTES, 10 * 1024 * 1024);
     }
 }

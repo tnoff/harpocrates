@@ -11,7 +11,7 @@ export interface Profile {
   relative_path: string | null;
   temp_directory: string | null;
   s3_key_prefix: string | null;
-  upload_chunk_size_mb: number | null;
+  chunk_size_bytes: number;
   is_active: boolean;
   created_at: string;
 }

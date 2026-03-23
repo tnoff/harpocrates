@@ -3,7 +3,7 @@
   import ConfirmModal from "$lib/components/ConfirmModal.svelte";
   import { toast } from "$lib/stores/toast.svelte";
 
-  interface OrphanedLocalEntry { local_file_id: number; backup_entry_id: number; local_path: string; }
+  interface OrphanedLocalEntry { local_file_id: number; file_entry_id: number; local_path: string; }
   interface OrphanedS3Object { key: string; size: number; }
 
   let activeTab = $state<"local" | "s3">("local");
@@ -137,7 +137,7 @@
                 <tr>
                   <td><input type="checkbox" checked={selectedLocalIds.has(orphan.local_file_id)} onchange={() => toggleLocalId(orphan.local_file_id)} /></td>
                   <td class="col-path" title={orphan.local_path}>{orphan.local_path}</td>
-                  <td>{orphan.backup_entry_id}</td>
+                  <td>{orphan.file_entry_id}</td>
                 </tr>
               {/each}
             </tbody>

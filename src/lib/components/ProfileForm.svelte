@@ -16,9 +16,8 @@
       s3_secret_key?: string;
       extra_env?: string | null;
       relative_path?: string | null;
-      temp_directory?: string | null;
       s3_key_prefix?: string | null;
-      upload_chunk_size_mb?: number | null;
+      chunk_size_bytes?: number | null;
     };
     onsubmit: (data: Record<string, unknown>) => Promise<void>;
     submitLabel?: string;
@@ -39,9 +38,8 @@
     s3SecretKey: initial.s3_secret_key ?? "",
     extraEnv: initial.extra_env ?? "",
     relativePath: initial.relative_path ?? "",
-    tempDirectory: initial.temp_directory ?? "",
     s3KeyPrefix: initial.s3_key_prefix ?? "",
-    uploadChunkSizeMb: initial.upload_chunk_size_mb ?? 256,
+    chunkSizeMb: initial.chunk_size_bytes ? Math.round(initial.chunk_size_bytes / (1024 * 1024)) : 10,
   }));
 
   let name = $state(iv.name);
@@ -53,9 +51,8 @@
   let s3SecretKey = $state(iv.s3SecretKey);
   let extraEnv = $state(iv.extraEnv);
   let relativePath = $state(iv.relativePath);
-  let tempDirectory = $state(iv.tempDirectory);
   let s3KeyPrefix = $state(iv.s3KeyPrefix);
-  let uploadChunkSizeMb = $state(iv.uploadChunkSizeMb);
+  let chunkSizeMb = $state(iv.chunkSizeMb);
   let importKey = $state("");
 
 
@@ -94,10 +91,9 @@
         s3_secret_key: s3SecretKey,
         extra_env: extraEnv || null,
         relative_path: relativePath || null,
-        temp_directory: tempDirectory || null,
         import_encryption_key: importKey || null,
         s3_key_prefix: s3KeyPrefix.trim() || null,
-        upload_chunk_size_mb: uploadChunkSizeMb > 0 ? uploadChunkSizeMb : null,
+        chunk_size_bytes: chunkSizeMb > 0 ? chunkSizeMb * 1024 * 1024 : null,
       });
     } catch (e) {
       error = String(e);
@@ -215,22 +211,9 @@
       <p class="form-hint">Local base directory to strip when storing file paths. For example, with a base of <code class="font-mono">/home/user/docs</code>, the file <code class="font-mono">/home/user/docs/report.pdf</code> is stored and restored as <code class="font-mono">report.pdf</code> relative to that path.</p>
     </div>
     <div>
-      <label class="form-label" for="pf-temp-dir">Temp Directory</label>
-      <div style="display: flex; gap: 0.5rem;">
-        <input id="pf-temp-dir" bind:value={tempDirectory} class="form-input" placeholder="/tmp/harpocrates" />
-        <button
-          type="button"
-          onclick={async () => { const p = await open({ directory: true, defaultPath: await homeDir() }); if (p) tempDirectory = p; }}
-          class="btn-secondary"
-          style="flex: none; padding-left: 0.75rem; padding-right: 0.75rem;"
-        >Browse</button>
-      </div>
-      <p class="form-hint">Local folder for temporary files during transfers. Defaults to your system temp folder if left blank.</p>
-    </div>
-    <div>
-      <label class="form-label" for="pf-chunk-size">Upload chunk size (MB)</label>
-      <input id="pf-chunk-size" type="number" min="5" max="10240" bind:value={uploadChunkSizeMb} class="form-input" style="max-width: 12rem;" />
-      <p class="form-hint">Files are encrypted and uploaded in chunks of this size. Larger chunks mean fewer S3 requests and faster transfers, but each chunk uses ~2× this amount of RAM. Default: 256 MB.</p>
+      <label class="form-label" for="pf-chunk-size">Chunk size (MB)</label>
+      <input id="pf-chunk-size" type="number" min="1" max="10240" bind:value={chunkSizeMb} class="form-input" style="max-width: 12rem;" />
+      <p class="form-hint">Files are split into chunks of this size for encryption and upload. Each chunk is stored as a separate S3 object, enabling deduplication. Default: 10 MB.</p>
     </div>
   </fieldset>
 

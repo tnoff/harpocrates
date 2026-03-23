@@ -16,31 +16,6 @@ mod throttle;
 #[cfg(test)]
 mod integration_tests;
 
-/// Clean up harpocrates temp files from all known temp directories.
-/// Covers the system temp dir plus any per-profile custom temp dirs from the DB.
-fn cleanup_temp_dirs(conn: &rusqlite::Connection) {
-    let mut dirs = vec![std::env::temp_dir()];
-
-    // Add any custom temp dirs configured in profiles.
-    if let Ok(profiles) = db::list_profiles(conn) {
-        for profile in profiles {
-            if let Some(ref custom) = profile.temp_directory {
-                let p = std::path::PathBuf::from(custom);
-                if !dirs.contains(&p) {
-                    dirs.push(p);
-                }
-            }
-        }
-    }
-
-    for dir in &dirs {
-        match crypto::cleanup_temp_files(dir) {
-            Ok(0) => {}
-            Ok(n) => println!("Cleaned up {} temp files from {:?}", n, dir),
-            Err(e) => eprintln!("Warning: temp cleanup failed for {:?}: {}", dir, e),
-        }
-    }
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -53,9 +28,6 @@ pub fn run() {
         .expect("Failed to initialize database");
 
     println!("Database initialized successfully");
-
-    // Clean up leftover temp files from any previous session.
-    cleanup_temp_dirs(&conn);
 
     let op_queue = queue::OperationQueue::new();
 
@@ -70,14 +42,7 @@ pub fn run() {
             q.start_worker(app.handle().clone());
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                let db = window.app_handle().state::<db::DbState>();
-                if let Ok(conn) = db.conn() {
-                    cleanup_temp_dirs(&conn);
-                };
-            }
-        })
+        .on_window_event(|_window, _event| {})
         .invoke_handler(tauri::generate_handler![
             // Phase 1
             commands::get_table_count,

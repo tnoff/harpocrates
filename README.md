@@ -8,19 +8,29 @@ Files are encrypted **before** they leave your machine. The S3 bucket contains o
 
 ## Features
 
-- **Client-side AES-256-GCM encryption** — files are encrypted locally before upload; the server never sees plaintext
+- **Client-side XChaCha20-Poly1305 encryption** — files are split into fixed-size chunks, each encrypted locally before upload; the server never sees plaintext
 - **Any S3-compatible backend** — AWS S3, Backblaze B2, Cloudflare R2, MinIO, or any provider with an S3 API
-- **Content-addressed deduplication** — identical files are stored once regardless of where they live on disk
-- **Change detection** — skips files whose size and modification time haven't changed; optionally force a full checksum comparison
+- **Content-addressed deduplication** — files are split into chunks identified by an HMAC of their content; identical chunks (within a profile) are stored once, enabling both whole-file and sub-file deduplication
+- **Change detection and resume** — skips files whose size and modification time haven't changed; a backup interrupted mid-run resumes automatically on the next run (the chunk deduplication check doubles as the resume check — only chunks not yet in S3 are uploaded)
 - **Multiple profiles** — separate configurations for different S3 buckets or encryption keys
 - **Read-only profiles** — mount a bucket as read-only for safe browsing and restore without risking writes
 - **Share manifests** — generate a UUID token that lets another Harpocrates user download specific files without exposing your full bucket
 - **Integrity verification** — re-download and re-hash any file to confirm it hasn't been tampered with
-- **Scramble (re-encrypt)** — assign new random UUIDs to selected files; invalidates any share tokens referencing them
+- **Scramble** — move selected files' chunks to new random S3 keys; invalidates any share tokens referencing them
 - **Bandwidth throttling** — set upload and download limits in KB/s; limits apply to the next chunk during active transfers
 - **Orphan cleanup** — find and remove dangling database entries or S3 objects that have lost their counterpart
 - **Database export / import** — portable JSON export of the local metadata database
 - **Real-time progress** — backup, restore, verify, and scramble all report per-file progress in the persistent status footer
+
+---
+
+## Upgrading from v1
+
+> **Breaking change — existing database is not preserved.**
+>
+> Version 2 introduced content-addressed chunk storage with a new database schema (v5). On first launch after upgrading, Harpocrates automatically migrates the database by dropping all v1 tables (`backup_entry`, `local_file`, etc.) and creating the new schema. **Your S3 objects are not touched**, but the local file index is wiped — the Files tab will be empty after the upgrade.
+>
+> To rebuild the index, re-run **Backup Directory** on your folders. Files will be re-uploaded as new content-addressed chunks. Your old v1 S3 objects (stored as bare UUIDs) will appear as orphans in the **Cleanup** tab and can be deleted from there once the re-backup is complete.
 
 ---
 
@@ -38,7 +48,7 @@ See [SECURITY.md](SECURITY.md) for full details. The short version:
 
 | What is protected | How |
 |-------------------|-----|
-| File contents | AES-256-GCM with a per-file random salt and nonce derived via Argon2id |
+| File contents | XChaCha20-Poly1305 with a per-chunk random nonce; each chunk is encrypted independently in memory |
 | S3 credentials | OS keychain (Keychain on macOS, Credential Manager on Windows, Secret Service on Linux) |
 | Encryption key | Held only by you — shown once at profile creation, never stored by Harpocrates |
 
@@ -129,7 +139,7 @@ Go to the **Share** tab. Select files first in the **Files** tab, then:
 
 ### Scramble
 
-Re-assigns new random S3 UUIDs to selected files (or all files). This invalidates any active share manifests that reference those files. Use this if you want to revoke access for someone who had your bucket credentials but not your encryption key.
+Moves the S3 chunks of selected files (or all files) to new random keys. Only chunks exclusively owned by the selected files are moved — chunks shared with other files are left untouched to preserve deduplication. Any share manifests referencing the scrambled files are invalidated. Use this if you want to revoke access for someone who had your bucket credentials but not your encryption key.
 
 ### Cleanup
 
@@ -174,18 +184,19 @@ s3:HeadBucket
 
 ### Key Prefix and IAM scoping
 
-Each profile can optionally set a **Key Prefix** (e.g. `team-alpha`). All objects for that profile are then stored at `{prefix}/{uuid}` instead of bare `{uuid}`. This lets you scope IAM policies to a sub-path of a shared bucket — for example, granting one set of credentials access only to `team-alpha/*` and another to `team-beta/*`. Harpocrates does not configure these policies; you must set them up in your provider's IAM console.
+Each profile can optionally set a **Key Prefix** (e.g. `team-alpha`). All chunk and manifest objects for that profile are then stored under `{prefix}/c/` and `{prefix}/m/` respectively. This lets you scope IAM policies to a sub-path of a shared bucket — for example, granting one set of credentials access only to `team-alpha/*` and another to `team-beta/*`. Harpocrates does not configure these policies; you must set them up in your provider's IAM console.
 
 ---
 
 ## Data Layout on S3
 
-Every file is stored as a randomly generated UUID with no extension or readable metadata.
+Files are split into fixed-size chunks. Each chunk is stored as a separate S3 object at a content-addressed key — the key is derived from an HMAC of the chunk's plaintext, so identical chunk content maps to the same object. Share manifests use a separate namespace.
 
 ```
 s3://your-bucket/
-  550e8400-e29b-41d4-a716-446655440000
-  6ba7b810-9dad-11d1-80b4-00c04fd430c8
+  c/a3f1b2...   (encrypted chunk, key = HMAC of plaintext)
+  c/9d4e7c...
+  m/550e8400...  (encrypted share manifest)
   ...
 ```
 
@@ -193,8 +204,9 @@ If a **Key Prefix** is configured in the profile, all objects are stored under i
 
 ```
 s3://your-bucket/
-  team-alpha/550e8400-e29b-41d4-a716-446655440000
-  team-alpha/6ba7b810-9dad-11d1-80b4-00c04fd430c8
+  team-alpha/c/a3f1b2...
+  team-alpha/c/9d4e7c...
+  team-alpha/m/550e8400...
   ...
 ```
 

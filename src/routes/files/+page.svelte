@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
@@ -38,9 +39,7 @@
     }
   }
 
-  $effect(() => {
-    loadFiles();
-  });
+  onMount(() => { loadFiles(); });
 
   let searchTimeout: ReturnType<typeof setTimeout>;
   function handleSearch(value: string) {

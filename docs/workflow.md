@@ -94,7 +94,7 @@ The files are downloaded from S3 and decrypted locally — only the intended rec
 
 ### Revoking a share
 
-If you need to invalidate a share token, go to **Scramble** and re-scramble the relevant files. This assigns new random UUIDs to those files in S3, making the old token permanently invalid. Anyone who still has your bucket credentials but not your encryption key will no longer be able to access the content.
+If you need to invalidate a share token, go to **Scramble** and re-scramble the relevant files. This moves those files' chunks to new random S3 keys, making the old token permanently invalid. Anyone who still has your bucket credentials but not your encryption key will no longer be able to access the content.
 
 ---
 

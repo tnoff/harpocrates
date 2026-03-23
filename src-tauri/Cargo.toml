@@ -1,6 +1,6 @@
 [package]
 name = "harpocrates"
-version = "0.1.1"
+version = "0.2.0"
 description = "Encrypted S3 File Manager"
 authors = ["tnorth"]
 edition = "2021"
@@ -19,8 +19,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.39", features = ["bundled"] }
-aes-gcm = "0.10"
-argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 aws-sdk-s3 = "1"
 aws-config = "1"
