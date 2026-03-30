@@ -3,8 +3,21 @@ updates:
   - package-ecosystem: "npm"
     directory: "."
     schedule:
-      interval: "daily"
+      interval: "weekly"
+    groups:
+      svelte-ecosystem:
+        patterns:
+          - "@sveltejs/*"
+          - "vite"
+          - "typescript"
   - package-ecosystem: "cargo"
     directory: "src-tauri"
     schedule:
-      interval: "daily"
+      interval: "weekly"
+    groups:
+      rust-crypto:
+        patterns:
+          - "sha2"
+          - "md-5"
+          - "hmac"
+          - "digest"
