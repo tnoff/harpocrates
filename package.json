@@ -30,7 +30,7 @@
     "@testing-library/svelte": "^5.3.1",
     "@vitest/coverage-v8": "^4.1.4",
     "happy-dom": "^20.9.0",
-    "svelte": "^5.55.4",
+    "svelte": "^5.55.5",
     "svelte-check": "^4.4.6",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.3",
