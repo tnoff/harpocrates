@@ -2,21 +2,11 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    tags:
+      - 'v*'
 
 jobs:
-  tag:
-    uses: tnoff/github-workflows/.github/workflows/tag.yml@bcd92d35de2f78d9b6e2ed9d69637561e47c93dc
-    with:
-      version_file: './package.json'
-      version_file_type: json
-      version_json_key: version
-    permissions:
-      contents: write
-
   build:
-    needs: tag
-    if: needs.tag.outputs.tag_created == 'true'
     permissions:
       contents: write
     strategy:
@@ -79,8 +69,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ needs.tag.outputs.version }}
-          releaseName: "Harpocrates ${{ needs.tag.outputs.version }}"
+          tagName: ${{ github.ref_name }}
+          releaseName: "Harpocrates ${{ github.ref_name }}"
           releaseBody: |
             See the assets below to download and install this version of Harpocrates.
           releaseDraft: false

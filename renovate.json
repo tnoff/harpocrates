@@ -1,0 +1,25 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["npm", "cargo", "gitlabci"],
+  "labels": ["dependencies"],
+  "rebaseWhen": "behind-base-branch",
+  "packageRules": [
+    {
+      "matchPackagePrefixes": ["@sveltejs/"],
+      "groupName": "svelte ecosystem"
+    },
+    {
+      "matchPackageNames": ["vite", "typescript"],
+      "groupName": "svelte ecosystem"
+    },
+    {
+      "matchPackageNames": ["sha2", "md-5", "hmac", "digest"],
+      "groupName": "rust crypto"
+    },
+    {
+      "matchUpdateTypes": ["patch"],
+      "automerge": true
+    }
+  ]
+}
