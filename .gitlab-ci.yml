@@ -1,18 +1,18 @@
 include:
   - project: 'tnoff-projects/github-workflows'
-    ref: c727d141564e2e8c86b1ac327df3698e0d521640
+    ref: 3da3fbad9511bedebfa258d09af3267697709fcb
     file: '/gitlab/tag.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: c727d141564e2e8c86b1ac327df3698e0d521640
+    ref: 3da3fbad9511bedebfa258d09af3267697709fcb
     file: '/gitlab/discord-notify.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: c727d141564e2e8c86b1ac327df3698e0d521640
+    ref: 3da3fbad9511bedebfa258d09af3267697709fcb
     file: '/gitlab/renovate.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: c727d141564e2e8c86b1ac327df3698e0d521640
+    ref: 3da3fbad9511bedebfa258d09af3267697709fcb
     file: '/gitlab/trufflehog.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: c727d141564e2e8c86b1ac327df3698e0d521640
+    ref: 3da3fbad9511bedebfa258d09af3267697709fcb
     file: '/gitlab/bump-version.yml'
 
 default:
@@ -32,6 +32,7 @@ bump-version:
     VERSION_FILE: 'package.json'
     VERSION_FILE_TYPE: 'json'
     VERSION_JSON_KEY: 'version'
+    GITLAB_PUSH_TOKEN: $RENOVATE_TOKEN
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^renovate\/dev-/
 
@@ -133,5 +134,7 @@ notify-merged:
 renovate:
   extends: .renovate
   stage: renovate
+  variables:
+    GITHUB_COM_TOKEN: $GITHUB_BOT_TOKEN
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
