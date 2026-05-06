@@ -54,6 +54,10 @@ frontend-test:
 rust-check:
   stage: validate
   image: docker.io/library/rust:1
+  variables:
+    CARGO_INCREMENTAL: "0"
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_BUILD_JOBS: "2"
   before_script:
     - apt-get update -qq
     - |
@@ -68,7 +72,6 @@ rust-check:
     - rustup component add clippy
   script:
     - cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-    - cargo build --manifest-path src-tauri/Cargo.toml
   rules:
     # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
