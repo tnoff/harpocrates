@@ -38,7 +38,7 @@ bump-version:
 
 frontend-test:
   stage: validate
-  image: docker.io/library/node:20-slim
+  image: docker.io/library/node:24-slim
   before_script:
     - npm ci
   script:
