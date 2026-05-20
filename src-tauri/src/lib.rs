@@ -29,6 +29,9 @@ pub fn run() {
 
     println!("Database initialized successfully");
 
+    credentials::register_default_store()
+        .expect("Failed to register credential store");
+
     let op_queue = queue::OperationQueue::new();
 
     tauri::Builder::default()

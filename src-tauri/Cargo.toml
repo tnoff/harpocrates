@@ -22,7 +22,7 @@ rusqlite = { version = "0.39", features = ["bundled"] }
 chacha20poly1305 = "0.10"
 hmac = "0.12"
 sha2 = "0.10"
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring-core = "1"
 aws-sdk-s3 = "1"
 aws-config = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -33,6 +33,15 @@ rand = "0.10"
 dirs = "6"
 hex = "0.4"
 regex = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"

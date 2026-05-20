@@ -384,6 +384,7 @@ mod tests {
 
     #[test]
     fn test_create_profile_accepts_valid_hex_import_key() {
+        crate::credentials::init_test_store();
         let conn = db::open_test_db();
         let valid_key = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
         let result = create_profile(
@@ -396,6 +397,7 @@ mod tests {
 
     #[test]
     fn test_create_profile_derives_key_from_passphrase() {
+        crate::credentials::init_test_store();
         let conn = db::open_test_db();
         let result = create_profile(
             &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
@@ -416,6 +418,7 @@ mod tests {
 
     #[test]
     fn test_create_profile_passphrase_trims_whitespace() {
+        crate::credentials::init_test_store();
         let conn = db::open_test_db();
         let result = create_profile(
             &conn, "test", "read-write", "https://s3.test.com", None, "bucket",
