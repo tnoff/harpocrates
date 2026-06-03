@@ -4,7 +4,7 @@ use std::path::Path;
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use md5::{Digest, Md5};
 use rand::RngExt;
 use sha2::Sha256;
@@ -38,7 +38,7 @@ pub fn derive_key_from_passphrase(passphrase: &str) -> [u8; 32] {
 /// Compute HMAC-SHA256(key, data) and return the result as a lowercase hex string.
 /// Used as the chunk's content-addressed identity: same content + same key → same hash.
 pub fn compute_chunk_hmac(key_bytes: &[u8], data: &[u8]) -> String {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key_bytes)
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key_bytes)
         .expect("HMAC accepts any key length");
     mac.update(data);
     hex::encode(mac.finalize().into_bytes())
