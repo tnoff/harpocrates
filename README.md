@@ -225,3 +225,12 @@ s3://your-bucket/
 | `config.json` | App config (database path) |
 
 S3 credentials are stored in the OS keychain, not in `harpocrates.db`. The encryption key is stored nowhere by Harpocrates.
+
+---
+
+## For developers
+
+- [DEVELOPMENT.md](DEVELOPMENT.md) — build, test, project layout, Tauri command and queue patterns, database schema, release process.
+- [AGENTS.md](AGENTS.md) — non-obvious internals and load-bearing rules for AI coding agents.
+- [SECURITY.md](SECURITY.md) — threat model and cryptographic details.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to file issues and submit changes.
