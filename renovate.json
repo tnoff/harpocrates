@@ -1,9 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
-  "enabledManagers": ["npm", "cargo", "gitlabci"],
-  "labels": ["dependencies"],
-  "rebaseWhen": "behind-base-branch",
+  "extends": ["gitlab>tnoff-projects/github-workflows//renovate/default"],
+  "enabledManagers": ["npm", "cargo", "gitlabci", "custom.regex"],
   "packageRules": [
     {
       "matchPackagePrefixes": ["@sveltejs/"],
