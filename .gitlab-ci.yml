@@ -53,23 +53,11 @@ frontend-test:
 
 rust-check:
   stage: validate
-  image: docker.io/library/rust:1
+  image: $CI_RUST_TAURI_IMAGE
   variables:
     CARGO_INCREMENTAL: "0"
     CARGO_PROFILE_DEV_DEBUG: "0"
     CARGO_BUILD_JOBS: "2"
-  before_script:
-    - apt-get update -qq
-    - |
-      apt-get install -y -qq \
-        libwebkit2gtk-4.1-dev \
-        libappindicator3-dev \
-        librsvg2-dev \
-        patchelf \
-        libdbus-1-dev \
-        libssl-dev \
-        pkg-config
-    - rustup component add clippy
   script:
     - cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
   rules:
