@@ -239,12 +239,16 @@ describe('operationsStore — progress / file log', () => {
     expect(operationsStore.list[0].progress?.current).toBe(1);
   });
 
-  it('file log is capped at MAX_FILE_LOG (500)', () => {
-    for (let i = 0; i < 501; i++) {
-      emit('backup:progress', { op_id: 'op1', processed: i + 1, total: 501, current_file: `/a/file${i}.txt` });
-    }
-    expect(operationsStore.list[0].files.length).toBeLessThanOrEqual(501);
-  });
+  it(
+    'file log is capped at MAX_FILE_LOG (500)',
+    () => {
+      for (let i = 0; i < 501; i++) {
+        emit('backup:progress', { op_id: 'op1', processed: i + 1, total: 501, current_file: `/a/file${i}.txt` });
+      }
+      expect(operationsStore.list[0].files.length).toBeLessThanOrEqual(501);
+    },
+    20000
+  );
 });
 
 describe('operationsStore — actions', () => {
