@@ -23,9 +23,9 @@ default:
     - self-hosted
 
 stages:
-  - validate
+  - pr-check
   - test
-  - tag
+  - push
   - notify
   - renovate
 
@@ -39,8 +39,8 @@ bump-version:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^renovate\/dev-/
 
-frontend-test:
-  stage: validate
+"pr-check:frontend":
+  stage: pr-check
   image: docker.io/library/node:24-slim
   before_script:
     - npm ci
@@ -54,8 +54,8 @@ frontend-test:
       when: manual
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-rust-check:
-  stage: validate
+"pr-check:rust":
+  stage: pr-check
   image: $CI_RUST_TAURI_IMAGE
   variables:
     CARGO_INCREMENTAL: "0"
@@ -69,18 +69,18 @@ rust-check:
       when: manual
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-trufflehog:
+"pr-check:secrets":
   extends: .trufflehog
-  stage: validate
+  stage: pr-check
   rules:
     # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
       when: manual
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-tag-build:
+"push:tag":
   extends: .tag
-  stage: tag
+  stage: push
   variables:
     VERSION_FILE: './package.json'
     VERSION_FILE_TYPE: 'json'
@@ -89,7 +89,7 @@ tag-build:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
       when: on_success
 
-notify-mr:
+"notify:mr-opened":
   extends: .discord-notify
   stage: notify
   needs: []
@@ -103,10 +103,10 @@ notify-mr:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       when: always
 
-notify-tag-failure:
+"notify:tag-failure":
   extends: .discord-notify
   stage: notify
-  needs: [tag-build]
+  needs: ["push:tag"]
   variables:
     NOTIFY_TYPE: failure
     DISCORD_WEBHOOK_URL: $DISCORD_BUILD_FAILURE_WEBHOOK
@@ -114,7 +114,7 @@ notify-tag-failure:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
       when: on_failure
 
-notify-renovate-failure:
+"notify:renovate-failure":
   extends: .discord-notify
   stage: renovate
   needs: [renovate]
@@ -126,7 +126,7 @@ notify-renovate-failure:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: on_failure
 
-notify-merged:
+"notify:merged":
   extends: .discord-notify
   stage: notify
   needs: []
@@ -159,7 +159,7 @@ branch-cleanup:
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
 
-notify-cleanup-failure:
+"notify:cleanup-failure":
   extends: .discord-notify
   stage: renovate
   needs: [branch-cleanup]
