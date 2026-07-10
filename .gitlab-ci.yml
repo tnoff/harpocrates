@@ -1,21 +1,21 @@
 include:
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/tag.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/discord-notify.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/renovate.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/branch-cleanup.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/trufflehog.yml'
   - project: 'tnoff-projects/github-workflows'
-    ref: 04c5fd3ccff6dca038591aafcc321d759630aad1
+    ref: cfe4637ce67d24b088e57e2f26db6ed9cc047f5b
     file: '/gitlab/bump-version.yml'
 
 default:
