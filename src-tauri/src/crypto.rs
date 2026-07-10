@@ -56,10 +56,10 @@ pub fn encrypt_chunk(key_bytes: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, 
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).expect("nonce is exactly NONCE_LEN bytes");
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| AppError::Crypto(format!("Chunk encryption failed: {}", e)))?;
 
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -78,14 +78,14 @@ pub fn decrypt_chunk(key_bytes: &[u8; 32], encrypted: &[u8]) -> Result<Vec<u8>, 
         ));
     }
 
-    let nonce = Nonce::from_slice(&encrypted[..NONCE_LEN]);
+    let nonce = Nonce::try_from(&encrypted[..NONCE_LEN]).expect("slice is exactly NONCE_LEN bytes");
     let ciphertext = &encrypted[NONCE_LEN..];
 
     let cipher = ChaCha20Poly1305::new_from_slice(key_bytes)
         .map_err(|e| AppError::Crypto(format!("Failed to create cipher: {}", e)))?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| AppError::Crypto(format!("Chunk decryption failed (wrong key or tampered data): {}", e)))
 }
 
