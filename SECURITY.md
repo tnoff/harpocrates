@@ -161,4 +161,9 @@ Information leakage implications:
 
 ## Reporting Security Issues
 
+> **This project is archived and unsupported — no version of Harpocrates receives security fixes.**
+> Reports are still read, and a confirmed issue may be noted in the README so other users are
+> warned, but no patched release will be published. See the archive notice in
+> [README.md](README.md).
+
 Please do not report security vulnerabilities via public GitHub issues. Instead, contact the maintainer directly.

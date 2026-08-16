@@ -1,148 +1,19 @@
-include:
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/tag.yml'
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/discord-notify.yml'
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/renovate.yml'
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/branch-cleanup.yml'
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/trufflehog.yml'
-  - project: 'tnoff-projects/github-workflows'
-    ref: f67fcdcca917548baa7a350797d3e3004f570d7d
-    file: '/gitlab/bump-version.yml'
-
-default:
-  # Ride out ci-pool cold-starts / node churn (warm ci floor + autoscaler
-  # scale-down grace live in terraform nodes_v2_ci and docker-apps
-  # cluster-autoscaler). These `when:` classes are infra-side failures, never
-  # `script_failure`, so a failing test/lint is never silently retried. GitLab
-  # caps retry:max at 2 (= 3 total attempts).
-  retry:
-    max: 2
-    when:
-      - runner_system_failure
-      - stuck_or_timeout_failure
-      - scheduler_failure
-  tags:
-    - self-hosted
-
-stages:
-  - pr-check
-  - test
-  - push
-  - notify
-  - renovate
-
-bump-version:
-  extends: .bump-version
-  variables:
-    VERSION_FILE: 'package.json'
-    VERSION_FILE_TYPE: 'json'
-    VERSION_JSON_KEY: 'version'
-    GITLAB_PUSH_TOKEN: $RENOVATE_TOKEN
+# Harpocrates is ARCHIVED and unsupported — see README.md.
+#
+# CI is intentionally disabled. The `workflow` rule below blocks pipeline
+# creation for every source (push, merge request, schedule, web, API), so no
+# job in this file ever runs. The placeholder job exists only because GitLab
+# rejects a `.gitlab-ci.yml` that contains no visible jobs.
+#
+# The previous pipeline (pr-check frontend/rust/secrets, tag, discord-notify,
+# renovate, branch-cleanup, bump-version) is preserved in git history at the
+# parent of the commit that archived the project. To revive CI, restore this
+# file from there and re-enable CI/CD in Settings > General > Visibility.
+workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^renovate\/dev-/
+    - when: never
 
-"pr-check:frontend":
-  stage: pr-check
-  image: docker.io/library/node:24-slim
-  before_script:
-    - npm ci
+archived-placeholder:
+  stage: build
   script:
-    - npx svelte-kit sync
-    - npm test
-    - npm run build
-  rules:
-    # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-
-"pr-check:rust":
-  stage: pr-check
-  image: $CI_RUST_TAURI_IMAGE
-  variables:
-    CARGO_INCREMENTAL: "0"
-    CARGO_PROFILE_DEV_DEBUG: "0"
-    CARGO_BUILD_JOBS: "2"
-  script:
-    - cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
-  rules:
-    # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-
-"pr-check:secrets":
-  extends: .trufflehog
-  stage: pr-check
-  rules:
-    # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-
-"push:tag":
-  extends: .tag
-  stage: push
-  variables:
-    VERSION_FILE: './package.json'
-    VERSION_FILE_TYPE: 'json'
-    VERSION_JSON_KEY: 'version'
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
-      when: on_success
-
-"notify:mr-opened":
-  extends: .discord-notify
-  stage: notify
-  needs: []
-  variables:
-    NOTIFY_TYPE: mr_opened
-    DISCORD_WEBHOOK_URL: $DISCORD_MR_OPENED_WEBHOOK
-  rules:
-    # Fork MRs require a project member to manually trigger jobs — prevents untrusted code from running CI automatically
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != $CI_PROJECT_ID
-      when: manual
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: always
-
-"notify:merged":
-  extends: .discord-notify
-  stage: notify
-  needs: []
-  variables:
-    NOTIFY_TYPE: mr_merged
-    DISCORD_WEBHOOK_URL: $DISCORD_MR_MERGED_WEBHOOK
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "schedule"
-      when: always
-
-renovate:
-  extends: .renovate
-  stage: renovate
-  variables:
-    GITHUB_COM_TOKEN: $GITHUB_BOT_TOKEN
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
-
-# Scheduled prune of stale automation branches (bump/* + renovate/*) left
-# behind because remove_source_branch only fires on MR merge, not on the
-# API-driven close of a superseded bump/renovate MR. Rides the weekly
-# schedule and reuses RENOVATE_TOKEN. See the github-workflows
-# .branch-cleanup template and docs runbooks/branch-cleanup.md.
-branch-cleanup:
-  extends: .branch-cleanup
-  stage: renovate
-  variables:
-    CLEANUP_AGE_DAYS: "30"
-    DRY_RUN: "false"
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - echo "Harpocrates is archived; CI is disabled."

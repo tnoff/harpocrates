@@ -1,5 +1,10 @@
 # Contributing
 
+> **Harpocrates is archived and unsupported — see the notice in [README.md](README.md).**
+> Issues and merge requests are not monitored, CI no longer runs on them, and the release
+> flow described below is retired. The rest of this document is kept for anyone forking
+> the project.
+
 This GitHub repository is a mirror. Please open merge requests and file issues through the GitLab project:
 
 **https://gitlab.com/tnoff-projects/harpocrates**

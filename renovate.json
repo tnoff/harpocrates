@@ -1,42 +1,5 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["gitlab>tnoff-projects/github-workflows//renovate/default"],
-  "enabledManagers": ["npm", "cargo", "gitlabci", "custom.regex"],
-  "packageRules": [
-    {
-      "description": "Keep the svelte toolchain moving as one unit. This matters most on MAJORS — typescript v7 and @sveltejs/kit have to land together or the build breaks. Below, the per-manager rules take over for patch/minor, so this rule is really about majors. Migrated off the deprecated matchPackagePrefixes to a glob.",
-      "matchPackageNames": ["@sveltejs/**", "vite", "typescript"],
-      "groupName": "svelte ecosystem"
-    },
-    {
-      "description": "RustCrypto crates are all 0.x, so every bump reads as a MAJOR to semver and would otherwise split into four separate MRs that don't compile apart (sha2 0.11 needs digest 0.11). Keep them welded together.",
-      "matchPackageNames": ["sha2", "md-5", "hmac", "digest"],
-      "groupName": "rust crypto"
-    },
-    {
-      "description": "Lock-file-only updates, cargo. src-tauri/Cargo.toml pins by major only (tokio = \"1\", regex = \"1\", aws-sdk-s3 = \"1\"), so a 1.52 -> 1.53 bump touches Cargo.lock alone and cannot violate a declared constraint — verified on !101, whose entire diff is src-tauri/Cargo.lock. Together with the npm rule below these were 30 of the 74 dependency MRs merged by hand since 2026-05-01. Grouped per manager so a rust build failure never blocks the js batch, and vice versa.",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["patch", "lockfileUpdate"],
-      "groupName": "cargo patch + lockfile",
-      "automerge": true
-    },
-    {
-      "description": "Lock-file-only updates, npm. Same shape as the cargo rule — verified on !122, whose entire diff is package-lock.json. Also absorbs the blanket patch automerge this config used to carry as a standalone rule, so patches stay hands-off but arrive batched instead of one MR at a time.",
-      "matchManagers": ["npm"],
-      "matchUpdateTypes": ["patch", "lockfileUpdate"],
-      "groupName": "npm patch + lockfile",
-      "automerge": true
-    },
-    {
-      "description": "Minor bumps that DO change a manifest. The built-in monorepo presets already group aws-sdk-rust/serde internally, but they still arrive as separate MRs every run — aws-sdk-rust alone was 9 of the 34 remaining hand-merges. One batch per side, reviewed rather than automerged because these change the declared range.",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor"],
-      "groupName": "rust deps (minor)"
-    },
-    {
-      "matchManagers": ["npm"],
-      "matchUpdateTypes": ["minor"],
-      "groupName": "frontend deps (minor)"
-    }
-  ]
+  "description": "Harpocrates is archived and unsupported (see README.md). Renovate is disabled: the repo takes no further dependency updates, and its scheduled pipeline no longer runs because CI is turned off in .gitlab-ci.yml. `enabled: false` is a second, independent stop so the repo is still skipped if it is ever picked up by a Renovate run driven from outside this project. The previous config (grouping and automerge rules for the svelte, RustCrypto, cargo, and npm ecosystems) is preserved in git history at the parent of the commit that archived the project.",
+  "enabled": false
 }

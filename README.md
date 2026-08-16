@@ -1,5 +1,25 @@
 # Harpocrates
 
+> ## ⚠️ Archived — unsupported
+>
+> **Harpocrates has reached end of life and is no longer maintained.** The repository is kept
+> online for reference and so existing users can still download past releases, but:
+>
+> - **No support.** Issues and merge requests are not monitored or answered.
+> - **No fixes.** Bugs, including security issues, will not be patched. See [SECURITY.md](SECURITY.md).
+> - **No releases.** No further versions will be published; the last release is `v0.2.0`.
+> - **No dependency updates.** CI and Renovate are disabled, so the pinned dependencies in
+>   `package-lock.json` and `src-tauri/Cargo.lock` will drift further out of date over time.
+>
+> **If you are still using Harpocrates:** the app keeps working, and nothing in your S3 bucket
+> is affected by this change. Your data is not locked in — everything needed to read it yourself
+> is documented in [SECURITY.md](SECURITY.md) (encryption scheme) and
+> [Data Layout on S3](#data-layout-on-s3) (chunk and manifest key structure). Export your
+> metadata database from the **Settings** tab before you stop using the app, and keep your
+> encryption key: without it the chunks in S3 cannot be decrypted by anyone, including you.
+>
+> Everything below this notice describes the app as it was at end of life and is left unchanged.
+
 A cross-platform desktop application for encrypted, deduplicated file backup to any S3-compatible object store.
 
 Files are encrypted **before** they leave your machine. The S3 bucket contains only ciphertext. Only someone with your encryption key can read anything stored there.
